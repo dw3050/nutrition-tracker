@@ -43,27 +43,13 @@ PORT = 8420
 # OAuth更"标准"，但需要去Google Cloud Console注册应用、处理回调地址这些
 # 额外步骤，对你这个个人小工具来说投入产出不成正比，先用这一版。
 #
-# 账号通过环境变量NUTRITION_USERS配置，格式："用户名1:密码1,用户名2:密码2"
-# 比如 NUTRITION_USERS=dongyao:某个密码,friend:另一个密码
-# 想让谁能访问，就把谁的账号密码加进这个环境变量，想收回权限，删掉对应那段就行。
+# 账号数据现在存在users.json里(nutrition_tracker.py里的USERS)，环境变量
+# NUTRITION_USERS/NUTRITION_ADMIN只在这个文件还不存在时用来做初始种子数据，
+# 之后新增/删除账号都是管理员通过网页操作，改的是这个文件，不是环境变量。
 #
-# 本地跑（没设置这个环境变量）时，不启用登录验证，效果跟以前一样直接能用。
+# 本地跑（种子账号都没配）时，不启用登录验证，效果跟以前一样直接能用。
 # ---------------------------------------------------------------------------
-def _parse_users(raw):
-    users = {}
-    if not raw:
-        return users
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if ":" not in pair:
-            continue
-        user, _, pw = pair.partition(":")
-        users[user.strip()] = pw.strip()
-    return users
-
-
-AUTH_USERS = _parse_users(os.environ.get("NUTRITION_USERS", ""))
-AUTH_ENABLED = bool(AUTH_USERS)
+AUTH_ENABLED = bool(nt.USERS)
 
 # 部署到Render(有PORT环境变量)时用HTTPS，cookie加Secure标记更安全；
 # 本地用http://localhost跑的时候，浏览器不会通过明文HTTP发送Secure cookie，
@@ -71,23 +57,32 @@ AUTH_ENABLED = bool(AUTH_USERS)
 SECURE_COOKIE = "PORT" in os.environ
 
 SESSION_TTL_SECONDS = 30 * 24 * 3600  # session有效期30天，不用每次打开都重新登录
-_sessions = {}  # token -> {"user": 用户名, "expires": 过期时间戳}
+_sessions = {}  # token -> {"user": 用户名, "is_admin": 是否管理员, "expires": 过期时间戳}
 
 
 def _create_session(username):
     token = secrets.token_hex(24)
-    _sessions[token] = {"user": username, "expires": time.time() + SESSION_TTL_SECONDS}
+    _sessions[token] = {
+        "user": username,
+        "is_admin": nt.is_admin_user(username),
+        "expires": time.time() + SESSION_TTL_SECONDS,
+    }
     return token
 
 
-def _get_session_user(token):
+def _get_session(token):
     session = _sessions.get(token)
     if not session:
         return None
     if session["expires"] < time.time():
         _sessions.pop(token, None)
         return None
-    return session["user"]
+    return session
+
+
+def _get_session_user(token):
+    session = _get_session(token)
+    return session["user"] if session else None
 
 
 def _parse_cookies(header_value):
@@ -121,9 +116,18 @@ def get_week_payload(days=7):
             "is_today": key == today_str,
             "kcal": data[key]["kcal"],
             "protein": data[key]["protein"],
+            "carb": data[key]["carb"],
+            "fat": data[key]["fat"],
             "veg": key in veg_days,
         })
     return week
+
+
+def _get_users_list():
+    return [
+        {"username": username, "is_admin": info.get("is_admin", False)}
+        for username, info in nt.USERS.items()
+    ]
 
 
 def get_foods_list():
@@ -145,11 +149,14 @@ def get_foods_list():
 
 def get_data_payload(days=7):
     nt.write_summary_csv()  # 顺手把导出用的汇总文件也同步一次，不影响图表本身的计算
+    target_kcal, target_protein, target_carb, target_fat = nt.get_targets()
     return {
         "week": get_week_payload(days),
         "foods": get_foods_list(),
-        "target_kcal": nt.DAILY_KCAL_TARGET,
-        "target_protein": nt.DAILY_PROTEIN_TARGET,
+        "target_kcal": target_kcal,
+        "target_protein": target_protein,
+        "target_carb": target_carb,
+        "target_fat": target_fat,
     }
 
 
@@ -198,6 +205,27 @@ HTML_PAGE = """<!DOCTYPE html>
     padding: 18px 20px;
   }
 
+  .page-header {
+    position: relative;
+    text-align: center;
+    margin-bottom: 14px;
+    padding-top: 2px;
+  }
+  .page-title {
+    font-size: 21px;
+    font-weight: 700;
+    color: var(--sage);
+    letter-spacing: 0.1em;
+    margin: 0;
+  }
+  .user-badge {
+    position: absolute;
+    top: 4px;
+    right: 0;
+    font-size: 11px;
+    color: var(--ink-soft);
+  }
+
   .top-bar {
     display: flex;
     align-items: center;
@@ -226,7 +254,7 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor: pointer;
   }
   .clear-btn:hover { background: var(--danger-flash); }
-  .logout-btn { margin-left: auto; }
+  #undo-btn { margin-left: auto; }
 
   .section-label {
     color: var(--ink-soft);
@@ -341,6 +369,41 @@ HTML_PAGE = """<!DOCTYPE html>
   .days-input::-webkit-outer-spin-button {
     -webkit-appearance: none;
     margin: 0;
+  }
+
+  /* 显示指标 + 显示范围 合并成一行：左边指标(可能换行)，右边天数输入框固定靠右，
+     两边挤在一起容易显得拥挤，所以指标按钮单独做得更紧凑一点(内边距/字号都比
+     其他按钮小一档)，天数输入框也从原来能装"自定义天数"占位文字的宽度缩到
+     只需要装两三位数字的宽度。窄屏下space-between+flex-wrap会让天数控件
+     自然掉到指标按钮下面一行，而不是硬挤在一起。 */
+  .display-controls-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+  }
+  .metric-picker {
+    gap: 5px;
+  }
+  .metric-picker .range-btn {
+    padding: 5px 9px;
+    font-size: 11px;
+  }
+  .days-control {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .days-control .days-input {
+    width: 52px;
+    text-align: center;
+  }
+  .days-suffix {
+    font-size: 12px;
+    color: var(--ink-soft);
   }
 
   .food-row {
@@ -661,31 +724,43 @@ HTML_PAGE = """<!DOCTYPE html>
     .bar-label { width: 38px; font-size: 11px; }
     .bar-value { width: 40px; font-size: 11px; }
     .food-edit-form { grid-template-columns: 1fr; }
+    .metric-picker .range-btn { padding: 6px 8px; font-size: 10.5px; }
+    .days-control .days-input { width: 46px; }
   }
 </style>
 </head>
 <body>
   <div class="panel">
 
-    <div class="top-bar">
-      <button class="btn-small" id="undo-btn">撤回上一步</button>
-      <button class="clear-btn" id="clear-btn">清空今天</button>
-      <button class="btn-small" id="open-history-btn">编辑历史</button>
-      <button class="btn-small" id="open-foods-btn">管理食物</button>
-      __LOGOUT_BUTTON__
+    <div class="page-header">
+      <h1 class="page-title">饮食记录</h1>
+      <div class="user-badge" id="user-badge"></div>
     </div>
 
-    <div class="section-label">显示范围</div>
-    <div class="range-picker">
-      <button class="range-btn active" data-days="7">7天</button>
-      <button class="range-btn" data-days="30">30天</button>
-      <button class="range-btn" data-days="60">60天</button>
-      <input type="number" id="custom-days" class="days-input" placeholder="自定义天数" min="1" max="365">
+    <div class="top-bar">
+      <button class="clear-btn" id="clear-btn">清空今天</button>
+      <button class="btn-small" id="open-history-btn">编辑历史</button>
+      <button class="btn-small" id="open-foods-btn">管理食物/目标</button>
+      __LOGOUT_BUTTON__
+      <button class="btn-small" id="undo-btn">撤回上一步</button>
+    </div>
+
+    <div class="section-label">显示</div>
+    <div class="display-controls-row">
+      <div class="range-picker metric-picker" id="metric-picker">
+        <button class="range-btn active" data-metric="kcal">热量</button>
+        <button class="range-btn active" data-metric="protein">蛋白质</button>
+        <button class="range-btn" data-metric="carb">碳水</button>
+        <button class="range-btn" data-metric="fat">脂肪</button>
+      </div>
+      <div class="days-control">
+        <input type="number" id="custom-days" class="days-input" value="7" min="1" max="365">
+        <span class="days-suffix">天</span>
+      </div>
     </div>
 
     <div class="section-label" id="range-title">过去 7 天</div>
-    <div id="chart-kcal" class="chart-group"></div>
-    <div id="chart-protein" class="chart-group"></div>
+    <div id="chart-container"></div>
 
     <div class="section-label">记录</div>
     <div id="food-list"></div>
@@ -708,14 +783,27 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- ---- 管理食物 弹窗 ---- -->
+  <!-- ---- 管理食物/目标 弹窗 ---- -->
   <div class="modal-overlay" id="foods-modal">
     <div class="modal-box">
       <div class="modal-header">
-        <div class="modal-title">管理食物</div>
+        <div class="modal-title">管理食物/目标</div>
         <button class="modal-close-btn" id="close-foods-btn">✕</button>
       </div>
-      <div id="food-edit-list"></div>
+
+      <div class="add-food-label">每日目标</div>
+      <div class="food-edit-form open">
+        <div><label>总热量目标(kcal)</label><input type="number" step="any" id="target-kcal-input"></div>
+        <div><label>总蛋白质目标(g)</label><input type="number" step="any" id="target-protein-input"></div>
+        <div><label>总碳水目标(g，选填)</label><input type="number" step="any" id="target-carb-input"></div>
+        <div><label>总脂肪目标(g，选填)</label><input type="number" step="any" id="target-fat-input"></div>
+        <button class="food-edit-save-btn" id="save-targets-btn">保存目标</button>
+      </div>
+
+      <div class="add-food-section">
+        <div class="add-food-label">食物列表</div>
+        <div id="food-edit-list"></div>
+      </div>
 
       <div class="add-food-section">
         <div class="add-food-label">+ 添加新食物</div>
@@ -729,12 +817,29 @@ HTML_PAGE = """<!DOCTYPE html>
           <button class="food-edit-save-btn" id="add-food-save-btn">添加</button>
         </div>
       </div>
+
+      <div class="add-food-section" id="admin-users-section" style="display:none;">
+        <div class="add-food-label">用户管理（仅管理员可见）</div>
+        <div id="users-list"></div>
+        <div class="food-edit-form open" style="margin-top:10px;">
+          <div><label>新用户名</label><input type="text" id="new-user-name"></div>
+          <div><label>密码</label><input type="text" id="new-user-pass"></div>
+          <div class="full-width">
+            <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink);">
+              <input type="checkbox" id="new-user-admin" style="width:auto;"> 设为管理员
+            </label>
+          </div>
+          <button class="food-edit-save-btn" id="add-user-save-btn">添加用户</button>
+        </div>
+      </div>
     </div>
   </div>
 
 <script>
 let FOODS = [];
 let currentDays = 7;
+let selectedMetrics = new Set(JSON.parse(localStorage.getItem('nutritionMetrics') || '["kcal","protein"]'));
+let CURRENT_IS_ADMIN = false;
 
 async function loadInitial() {
   const res = await fetch(`/api/data?days=${currentDays}`);
@@ -743,31 +848,47 @@ async function loadInitial() {
   FOODS = data.foods;
   renderCharts(data);
   renderFoodList();
+
+  if (data.current_user && data.current_user !== 'local') {
+    document.getElementById('user-badge').textContent = `你好，${data.current_user}`;
+  }
+  CURRENT_IS_ADMIN = !!data.is_admin;
+  document.getElementById('admin-users-section').style.display = CURRENT_IS_ADMIN ? 'block' : 'none';
+  document.getElementById('target-kcal-input').value = data.target_kcal;
+  document.getElementById('target-protein-input').value = data.target_protein;
+  document.getElementById('target-carb-input').value = data.target_carb;
+  document.getElementById('target-fat-input').value = data.target_fat;
 }
 
-function setDays(n) {
-  currentDays = n;
-  document.querySelectorAll('.range-btn').forEach(btn => {
-    btn.classList.toggle('active', parseInt(btn.dataset.days) === n);
-  });
-  document.getElementById('custom-days').value = '';
-  loadInitial();
-}
+const METRIC_CONFIG = {
+  kcal:    { title: '🔥 总热量 (kcal)',   key: 'kcal',    fill: '█', showVeg: true,  target: payload => payload.target_kcal },
+  protein: { title: '💪 总蛋白质 (g)',    key: 'protein', fill: '▓', showVeg: false, target: payload => payload.target_protein },
+  carb:    { title: '🍞 总碳水 (g)',      key: 'carb',    fill: '▒', showVeg: false, target: payload => payload.target_carb },
+  fat:     { title: '🥑 总脂肪 (g)',      key: 'fat',     fill: '░', showVeg: false, target: payload => payload.target_fat },
+};
 
 function renderCharts(data) {
   document.getElementById('range-title').textContent = `过去 ${currentDays} 天`;
-  document.getElementById('chart-kcal').innerHTML =
-    buildChart('🔥 总热量 (kcal)', data.week, 'kcal', data.target_kcal, true);
-  document.getElementById('chart-protein').innerHTML =
-    buildChart('💪 总蛋白质 (g)', data.week, 'protein', data.target_protein, false);
+  const container = document.getElementById('chart-container');
+  container.innerHTML = '';
+  selectedMetrics.forEach(metric => {
+    const config = METRIC_CONFIG[metric];
+    if (!config) return;
+    const target = config.target ? config.target(data) : 0;
+    const div = document.createElement('div');
+    div.className = 'chart-group';
+    div.innerHTML = buildChart(config.title, data.week, config.key, target, config.showVeg, config.fill);
+    container.appendChild(div);
+  });
 }
 
-function buildChart(title, week, key, target, showVeg) {
+function buildChart(title, week, key, target, showVeg, fillChar) {
   const maxVal = Math.max(...week.map(d => d[key]), target, 1);
+  const hasTarget = target > 0;
   const rows = week.map(d => {
     const val = d[key];
     const fillPct = (val / maxVal) * 100;
-    const targetPct = (target / maxVal) * 100;
+    const targetPct = hasTarget ? (target / maxVal) * 100 : null;
     const labelClass = d.is_today ? 'bar-label today' : 'bar-label';
     const todayTag = d.is_today ? '今天' : '';
     const vegMark = showVeg && d.veg ? '✓' : '';
@@ -777,7 +898,7 @@ function buildChart(title, week, key, target, showVeg) {
         <div class="bar-today-tag">${todayTag}</div>
         <div class="bar-track">
           <div class="bar-fill" style="width:${fillPct}%"></div>
-          <div class="bar-target-line" style="left:${targetPct}%"></div>
+          ${hasTarget ? `<div class="bar-target-line" style="left:${targetPct}%"></div>` : ''}
         </div>
         <div class="bar-value">${val.toFixed(1)}</div>
         ${showVeg ? `<div class="bar-veg">${vegMark}</div>` : ''}
@@ -785,7 +906,8 @@ function buildChart(title, week, key, target, showVeg) {
     `;
   }).join('');
 
-  return `<div class="chart-title">${title} <span class="target">目标: ${target}</span></div>${rows}`;
+  const targetLabel = hasTarget ? `<span class="target">目标: ${target}</span>` : '';
+  return `<div class="chart-title">${title} ${targetLabel}</div>${rows}`;
 }
 
 function fmtNum(n) {
@@ -811,9 +933,9 @@ function renderFoodList() {
       </div>
       <div class="food-controls">
         <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
-        <button class="plus-btn" data-id="${food.id}">+1份</button>
         <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
         <button class="add-btn" data-id="${food.id}">✓</button>
+        <button class="plus-btn" data-id="${food.id}">+1份</button>
       </div>
     `;
     container.appendChild(row);
@@ -882,20 +1004,36 @@ async function submitDirect(foodId, servings, row) {
   }
 }
 
-document.querySelectorAll('.range-btn').forEach(btn => {
-  btn.addEventListener('click', () => setDays(parseInt(btn.dataset.days)));
-});
+function applyDaysInput() {
+  const v = parseInt(document.getElementById('custom-days').value);
+  if (!isNaN(v) && v > 0) {
+    currentDays = v;
+    loadInitial();
+  }
+}
 
 document.getElementById('custom-days').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     e.preventDefault();
-    const v = parseInt(e.target.value);
-    if (!isNaN(v) && v > 0) {
-      currentDays = v;
-      document.querySelectorAll('.range-btn').forEach(btn => btn.classList.remove('active'));
-      loadInitial();
-    }
+    applyDaysInput();
   }
+});
+document.getElementById('custom-days').addEventListener('blur', applyDaysInput);
+
+document.querySelectorAll('#metric-picker .range-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const metric = btn.dataset.metric;
+    if (selectedMetrics.has(metric)) {
+      if (selectedMetrics.size === 1) return;  // 至少保留一个指标，不能一个都不选
+      selectedMetrics.delete(metric);
+      btn.classList.remove('active');
+    } else {
+      selectedMetrics.add(metric);
+      btn.classList.add('active');
+    }
+    localStorage.setItem('nutritionMetrics', JSON.stringify(Array.from(selectedMetrics)));
+    loadInitial();
+  });
 });
 
 document.getElementById('clear-btn').addEventListener('click', async () => {
@@ -962,7 +1100,7 @@ function openModal(name) {
     window.history.pushState({ modal: name }, '', `#${name}`);
   }
   if (name === 'history') loadDayEntries(document.getElementById('edit-date').value);
-  if (name === 'foods') loadFoodEditList();
+  if (name === 'foods') { loadFoodEditList(); loadUsersList(); }
 }
 
 function closeModal() {
@@ -978,7 +1116,7 @@ function applyHash() {
     Object.values(MODALS).forEach(m => m.classList.remove('open'));
     MODALS[hash].classList.add('open');
     if (hash === 'history') loadDayEntries(document.getElementById('edit-date').value);
-    if (hash === 'foods') loadFoodEditList();
+    if (hash === 'foods') { loadFoodEditList(); loadUsersList(); }
   } else {
     Object.values(MODALS).forEach(m => m.classList.remove('open'));
   }
@@ -1247,8 +1385,123 @@ document.getElementById('add-food-save-btn').addEventListener('click', async () 
   }
 });
 
-loadInitial();
-applyHash();  // 如果页面一打开地址栏就带着#history或#foods，直接呈现对应弹窗
+// ---- 每日目标 ----
+document.getElementById('save-targets-btn').addEventListener('click', async () => {
+  const target_kcal = parseFloat(document.getElementById('target-kcal-input').value);
+  const target_protein = parseFloat(document.getElementById('target-protein-input').value);
+  const carbRaw = document.getElementById('target-carb-input').value;
+  const fatRaw = document.getElementById('target-fat-input').value;
+  const target_carb = carbRaw === '' ? 0 : parseFloat(carbRaw);
+  const target_fat = fatRaw === '' ? 0 : parseFloat(fatRaw);
+
+  if (isNaN(target_kcal) || isNaN(target_protein) || target_kcal <= 0 || target_protein <= 0) {
+    alert('热量和蛋白质目标必须是大于0的数字');
+    return;
+  }
+  if (isNaN(target_carb) || isNaN(target_fat) || target_carb < 0 || target_fat < 0) {
+    alert('碳水/脂肪目标不能是负数（可以留空或填0，代表不设目标线）');
+    return;
+  }
+
+  const res = await fetch('/api/settings/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_kcal, target_protein, target_carb, target_fat })
+  });
+  const result = await res.json();
+  if (result.ok) {
+    alert('目标已更新');
+    loadInitial();
+  } else {
+    alert('保存失败：' + (result.error || '未知错误'));
+  }
+});
+
+// ---- 用户管理(仅管理员可见可用，后端也会再校验一次权限，前端隐藏只是体验层面) ----
+async function loadUsersList() {
+  if (!CURRENT_IS_ADMIN) return;
+  const container = document.getElementById('users-list');
+  container.innerHTML = '<div class="empty-note">加载中…</div>';
+
+  const res = await fetch('/api/users');
+  if (res.status === 403) { container.innerHTML = ''; return; }
+  const data = await res.json();
+
+  container.innerHTML = '';
+  data.users.forEach(u => {
+    const row = document.createElement('div');
+    row.className = 'entry-row';
+    row.innerHTML = `
+      <div class="entry-info">
+        <div class="entry-name">${u.username}${u.is_admin ? '（管理员）' : ''}</div>
+      </div>
+      <div class="entry-controls">
+        <button class="entry-delete-btn">删除</button>
+      </div>
+    `;
+    container.appendChild(row);
+    row.querySelector('.entry-delete-btn').addEventListener('click', async () => {
+      if (!confirm(`确定删除用户"${u.username}"？删除后这个人将无法再登录。`)) return;
+      const res = await fetch('/api/users/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u.username })
+      });
+      const result = await res.json();
+      if (result.ok) {
+        loadUsersList();
+      } else {
+        alert('删除失败：' + (result.error || '未知错误'));
+      }
+    });
+  });
+}
+
+document.getElementById('add-user-save-btn').addEventListener('click', async () => {
+  const username = document.getElementById('new-user-name').value.trim();
+  const password = document.getElementById('new-user-pass').value.trim();
+  const is_admin = document.getElementById('new-user-admin').checked;
+  if (!username || !password) { alert('用户名和密码不能为空'); return; }
+
+  const res = await fetch('/api/users/add', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, is_admin })
+  });
+  const result = await res.json();
+  if (result.ok) {
+    document.getElementById('new-user-name').value = '';
+    document.getElementById('new-user-pass').value = '';
+    document.getElementById('new-user-admin').checked = false;
+    loadUsersList();
+  } else {
+    alert('添加失败：' + (result.error || '未知错误'));
+  }
+});
+
+// 根据localStorage里存的偏好，初始化指标选择器按钮的高亮状态
+document.querySelectorAll('#metric-picker .range-btn').forEach(btn => {
+  btn.classList.toggle('active', selectedMetrics.has(btn.dataset.metric));
+});
+
+// 必须先等loadInitial()真正拿到is_admin状态，applyHash()才能正确判断
+// 要不要在#foods这个hash下加载用户列表——两者不能并发触发。
+(async () => {
+  await loadInitial();
+  applyHash();  // 如果页面一打开地址栏就带着#history或#foods，直接呈现对应弹窗
+})();
+
+// 页面被切到后台再切回来时(比如晚上开着放一边，第二天早上回来看)，
+// 自动重新拉一次数据——不用轮询定时器一直悄悄耗资源，只在你真的
+// 回来看这个页面的那一刻才刷新，这是标准的"按需刷新"做法。
+// 只在编辑历史/管理食物这两个弹窗都没开着的时候才自动刷新，避免正在
+// 填表填到一半、切一下屏幕回来，表单内容被意外清空重置。
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const anyModalOpen = Object.values(MODALS).some(m => m.classList.contains('open'));
+  if (anyModalOpen) return;
+  loadInitial();
+});
 </script>
 </body>
 </html>
@@ -1329,6 +1582,16 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return _get_session_user(token)
 
+    def _current_is_admin(self):
+        if not AUTH_ENABLED:
+            return False  # 本地无认证模式下，"管理员"这个概念没有意义，统一当作否
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        token = cookies.get("session")
+        if not token:
+            return False
+        session = _get_session(token)
+        return bool(session and session.get("is_admin"))
+
     def _send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1388,12 +1651,20 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 7
             days = max(1, min(days, 365))  # 防止传入0、负数或离谱的大数字
-            self._send_json(get_data_payload(days))
+            payload = get_data_payload(days)
+            payload["current_user"] = user
+            payload["is_admin"] = self._current_is_admin()
+            self._send_json(payload)
         elif parsed.path == "/api/day":
             qs = parse_qs(parsed.query)
             date_str = qs.get("date", [""])[0]
             entries = nt.get_entries_for_date(date_str)
             self._send_json({"date": date_str, "entries": entries})
+        elif parsed.path == "/api/users":
+            if not self._current_is_admin():
+                self._send_json({"error": "只有管理员能查看用户列表"}, status=403)
+                return
+            self._send_json({"users": _get_users_list()})
         else:
             self.send_error(404, "Not Found")
 
@@ -1421,7 +1692,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             username = data.get("username", "")
             password = data.get("password", "")
-            if AUTH_USERS.get(username) == password and password != "":
+            if nt.check_login(username, password):
                 token = _create_session(username)
                 self.send_response(200)
                 cookie_attrs = f"session={token}; Path=/; HttpOnly; Max-Age={SESSION_TTL_SECONDS}"
@@ -1576,6 +1847,74 @@ class Handler(BaseHTTPRequestHandler):
             food_id = data.get("id", "")
             ok = nt.delete_food(food_id)
             self._send_json({"ok": ok, "foods": get_foods_list()})
+            return
+
+        if parsed.path == "/api/settings/update":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            try:
+                target_kcal = float(data.get("target_kcal"))
+                target_protein = float(data.get("target_protein"))
+                # 碳水/脂肪目标允许是0——0表示"不设目标线"，跟热量/蛋白质不一样，
+                # 那两个是核心指标必须大于0，碳水脂肪是可选的，不填就是不显示目标线。
+                target_carb = float(data.get("target_carb", 0) or 0)
+                target_fat = float(data.get("target_fat", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_json({"error": "目标值格式不对"}, status=400)
+                return
+            if target_kcal <= 0 or target_protein <= 0:
+                self._send_json({"error": "热量和蛋白质目标必须大于0"}, status=400)
+                return
+            if target_carb < 0 or target_fat < 0:
+                self._send_json({"error": "目标值不能是负数"}, status=400)
+                return
+            nt.update_targets(target_kcal, target_protein, target_carb, target_fat)
+            self._send_json({
+                "ok": True,
+                "target_kcal": target_kcal,
+                "target_protein": target_protein,
+                "target_carb": target_carb,
+                "target_fat": target_fat,
+            })
+            return
+
+        if parsed.path == "/api/users/add":
+            if not self._current_is_admin():
+                self._send_json({"error": "只有管理员能管理用户账号"}, status=403)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            ok, err = nt.add_user(
+                username=str(data.get("username", "")).strip(),
+                password=str(data.get("password", "")).strip(),
+                is_admin=bool(data.get("is_admin", False)),
+            )
+            self._send_json({"ok": ok, "error": err, "users": _get_users_list()})
+            return
+
+        if parsed.path == "/api/users/delete":
+            if not self._current_is_admin():
+                self._send_json({"error": "只有管理员能管理用户账号"}, status=403)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            ok, err = nt.delete_user(str(data.get("username", "")).strip())
+            self._send_json({"ok": ok, "error": err, "users": _get_users_list()})
             return
 
         if parsed.path != "/api/record":

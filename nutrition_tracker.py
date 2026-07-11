@@ -157,12 +157,135 @@ def get_vegetable_food_name():
     return FOODS.get("5", {}).get("name", "")
 
 
-# 每日目标（用于柱状图里画目标线）
-# 注意：这两个数字不因为鸡胸肉份量的不确定性而调整——它们是根据体重/身高/
-# 年龄/活动量/减脂速率算出来的独立生理需求值，跟某一种食物一份到底是1.1磅
-# 还是1.4磅没有因果关系，不应该因为后者去反推调整前者。
-DAILY_KCAL_TARGET = 1800
-DAILY_PROTEIN_TARGET = 200
+# ---------------------------------------------------------------------------
+# 每日目标（热量/蛋白质/碳水/脂肪）—— 存在settings.json里，可以通过网页修改，
+# 不再是写死在代码里的常量。热量/蛋白质种子值沿用之前算出来的1800/200；
+# 碳水/脂肪没有算过科学依据的目标值，默认给0——前端的规则是目标值为0就不画
+# 目标线，不会显示一条没有意义的假目标，等你自己设定了才会出现。
+# ---------------------------------------------------------------------------
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
+_DEFAULT_SETTINGS = {"target_kcal": 1800, "target_protein": 200, "target_carb": 0, "target_fat": 0}
+
+
+def _load_settings():
+    if os.path.exists(SETTINGS_PATH):
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        # 兼容旧版本settings.json(只有target_kcal/target_protein，没有碳水/脂肪)：
+        # 缺的字段直接补上默认值0，不用重新迁移整个文件。
+        for key, default_val in _DEFAULT_SETTINGS.items():
+            settings.setdefault(key, default_val)
+        return settings
+    _save_settings(_DEFAULT_SETTINGS)
+    return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings(settings_dict):
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings_dict, f, ensure_ascii=False, indent=2)
+
+
+_SETTINGS = _load_settings()
+
+
+def get_targets():
+    return (
+        _SETTINGS["target_kcal"],
+        _SETTINGS["target_protein"],
+        _SETTINGS.get("target_carb", 0),
+        _SETTINGS.get("target_fat", 0),
+    )
+
+
+def update_targets(target_kcal, target_protein, target_carb=0, target_fat=0):
+    _SETTINGS["target_kcal"] = target_kcal
+    _SETTINGS["target_protein"] = target_protein
+    _SETTINGS["target_carb"] = target_carb
+    _SETTINGS["target_fat"] = target_fat
+    _save_settings(_SETTINGS)
+
+
+# ---------------------------------------------------------------------------
+# 用户账号 —— 现在存在users.json里，不再只依赖环境变量。
+#
+# 环境变量 NUTRITION_USERS（格式"用户名1:密码1,用户名2:密码2"）和
+# NUTRITION_ADMIN（格式"用户名"，指定谁是管理员）只在users.json还不存在的
+# 时候用来做"种子数据"——第一次启动会把环境变量里的账号导入进这个文件，
+# 之后这个文件才是真正的数据来源，管理员通过网页新增/删除账号，都是在改
+# 这个文件，不会去改环境变量（环境变量运行时改不了，也不该改）。
+# ---------------------------------------------------------------------------
+USERS_PATH = os.path.join(DATA_DIR, "users.json")
+
+
+def _parse_users_env(raw):
+    users = {}
+    if not raw:
+        return users
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        user, _, pw = pair.partition(":")
+        users[user.strip()] = pw.strip()
+    return users
+
+
+def _load_users():
+    if os.path.exists(USERS_PATH):
+        with open(USERS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    seed = _parse_users_env(os.environ.get("NUTRITION_USERS", ""))
+    admin_name = os.environ.get("NUTRITION_ADMIN", "").strip()
+    users = {
+        user: {"password": pw, "is_admin": (user == admin_name)}
+        for user, pw in seed.items()
+    }
+    _save_users(users)
+    return users
+
+
+def _save_users(users_dict):
+    with open(USERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(users_dict, f, ensure_ascii=False, indent=2)
+
+
+USERS = _load_users()
+
+
+def check_login(username, password):
+    info = USERS.get(username)
+    if not info or not password:
+        return False
+    return info.get("password") == password
+
+
+def is_admin_user(username):
+    return USERS.get(username, {}).get("is_admin", False)
+
+
+def add_user(username, password, is_admin=False):
+    username = username.strip()
+    if not username or not password:
+        return False, "用户名或密码不能为空"
+    if username in USERS:
+        return False, "这个用户名已经存在"
+    USERS[username] = {"password": password, "is_admin": is_admin}
+    _save_users(USERS)
+    return True, None
+
+
+def delete_user(username):
+    if username not in USERS:
+        return False, "用户不存在"
+    if USERS[username].get("is_admin"):
+        other_admins = [u for u, info in USERS.items() if info.get("is_admin") and u != username]
+        if not other_admins:
+            return False, "不能删除最后一个管理员账号，会导致没人能管理用户"
+    del USERS[username]
+    _save_users(USERS)
+    return True, None
+
 
 CSV_PATH = os.path.join(DATA_DIR, "nutrition_log.csv")
 # 加了 id 和 food_id 两列——之前的版本没有任何方式能精确定位"某一条具体记录"，
@@ -518,22 +641,24 @@ def compute_all_daily_totals():
                 kcal = float(row["kcal"])
                 protein = float(row["protein_g"])
                 carb = float(row["carb_g"])
+                fat = float(row["fat_g"])
             except (TypeError, ValueError, KeyError):
                 print(f"⚠️  明细表里有一行数据读不了，已跳过: {row}")
                 continue
 
             if date_key not in totals_by_date:
-                totals_by_date[date_key] = {"kcal": 0.0, "protein": 0.0, "carb": 0.0}
+                totals_by_date[date_key] = {"kcal": 0.0, "protein": 0.0, "carb": 0.0, "fat": 0.0}
             totals_by_date[date_key]["kcal"] += kcal
             totals_by_date[date_key]["protein"] += protein
             totals_by_date[date_key]["carb"] += carb
+            totals_by_date[date_key]["fat"] += fat
 
     return totals_by_date
 
 
 def get_last_n_days_data(n=7):
     """
-    返回过去n天（含今天）的日期列表(旧→新)，以及对应的 {kcal, protein} 数据。
+    返回过去n天（含今天）的日期列表(旧→新)，以及对应的 {kcal, protein, carb, fat} 数据。
     直接调用 compute_all_daily_totals() 现算，不再读 SUMMARY_CSV_PATH。
     这样无论你手动怎么改明细表，图表永远反映明细表的真实内容，
     汇总CSV文件的状态完全不影响程序自己的计算结果——它只是个单向导出的报告，
@@ -546,8 +671,13 @@ def get_last_n_days_data(n=7):
     data = {}
     for d in dates:
         key = d.strftime("%Y-%m-%d")
-        day_total = all_totals.get(key, {"kcal": 0.0, "protein": 0.0, "carb": 0.0})
-        data[key] = {"kcal": day_total["kcal"], "protein": day_total["protein"]}
+        day_total = all_totals.get(key, {"kcal": 0.0, "protein": 0.0, "carb": 0.0, "fat": 0.0})
+        data[key] = {
+            "kcal": day_total["kcal"],
+            "protein": day_total["protein"],
+            "carb": day_total.get("carb", 0.0),
+            "fat": day_total.get("fat", 0.0),
+        }
 
     return dates, data
 
@@ -624,32 +754,33 @@ def print_weekly_bar_chart():
     veg_days = get_vegetable_days()
     today_str = datetime.now().date().strftime("%Y-%m-%d")
     max_bar_width = 30
+    target_kcal, target_protein, _, _ = get_targets()  # CLI版终端图表目前只画热量/蛋白质，碳水脂肪目标先不用
 
     print("=" * 70)
 
     # ---- 热量图 ----
     kcal_values = [data[d.strftime("%Y-%m-%d")]["kcal"] for d in dates]
     # 刻度取"当周最大实际值"和"目标值"中较大的一个，保证目标线一定在图内
-    max_kcal_scale = max(max(kcal_values), DAILY_KCAL_TARGET, 1)
+    max_kcal_scale = max(max(kcal_values), target_kcal, 1)
 
-    print(f"\n🔥 总热量 (kcal)  目标: {DAILY_KCAL_TARGET}")
+    print(f"\n🔥 总热量 (kcal)  目标: {target_kcal}")
     for d in dates:
         key = d.strftime("%Y-%m-%d")
         val = data[key]["kcal"]
         label = d.strftime("%m-%d") + (" 今天" if key == today_str else "     ")
         veg_mark = "✓" if key in veg_days else " "
-        print(_render_bar_row(label, val, DAILY_KCAL_TARGET, max_kcal_scale, max_bar_width, "█") + f"  {veg_mark}")
+        print(_render_bar_row(label, val, target_kcal, max_kcal_scale, max_bar_width, "█") + f"  {veg_mark}")
 
     # ---- 蛋白质图 ----
     protein_values = [data[d.strftime("%Y-%m-%d")]["protein"] for d in dates]
-    max_protein_scale = max(max(protein_values), DAILY_PROTEIN_TARGET, 1)
+    max_protein_scale = max(max(protein_values), target_protein, 1)
 
-    print(f"\n💪 总蛋白质 (g)  目标: {DAILY_PROTEIN_TARGET}")
+    print(f"\n💪 总蛋白质 (g)  目标: {target_protein}")
     for d in dates:
         key = d.strftime("%Y-%m-%d")
         val = data[key]["protein"]
         label = d.strftime("%m-%d") + (" 今天" if key == today_str else "     ")
-        print(_render_bar_row(label, val, DAILY_PROTEIN_TARGET, max_protein_scale, max_bar_width, "▓"))
+        print(_render_bar_row(label, val, target_protein, max_protein_scale, max_bar_width, "▓"))
 
     print("\n" + "=" * 70 + "\n")
 
