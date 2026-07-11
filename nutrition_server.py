@@ -15,12 +15,21 @@
 import json
 import os
 import secrets
+import sys
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import nutrition_tracker as nt
+
+# Render这类平台会把标准输出当成日志来源，但Python默认在非终端环境下用
+# "全缓冲"模式——print的内容攒在缓冲区里不会立刻发出去，对一个长期运行、
+# 不会主动退出的服务来说，日志可能会一直卡在缓冲区里，导致你在Render的
+# 日志页面上看不到任何实时输出。强制改成"行缓冲"：每写完一行就立刻发送，
+# 不再等缓冲区攒满。
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 PORT = 8420
 
@@ -1337,6 +1346,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            self._handle_get()
+        except Exception:
+            import traceback
+            traceback.print_exc()  # 完整报错堆栈打到标准输出，行缓冲已经打开，Render能实时看到
+            try:
+                self._send_json({"error": "服务器内部错误，已记录到日志"}, status=500)
+            except Exception:
+                pass  # 连错误响应都发不出去的话（比如连接已经断了），不再继续折腾
+
+    def _handle_get(self):
         parsed = urlparse(self.path)
 
         if parsed.path == "/login":
@@ -1378,6 +1398,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Not Found")
 
     def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_json({"error": "服务器内部错误，已记录到日志"}, status=500)
+            except Exception:
+                pass
+
+    def _handle_post(self):
         parsed = urlparse(self.path)
 
         if parsed.path == "/api/login":

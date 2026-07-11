@@ -182,13 +182,80 @@ SUMMARY_HEADER = ["date", "total_kcal", "total_protein_g", "total_carb_g"]
 
 
 def ensure_csv_exists():
+    """
+    确保明细表存在，且表头是正确的。这个函数现在做两件事，不只是"文件不存在就创建"：
+
+    1. 文件完全不存在 → 创建一个带正确表头的新文件，并打印一条明显的日志。
+       之前这个动作是静默的，你完全看不出"程序发现数据没了、自己重建了一份"
+       这件事发生过——现在会主动告诉你。
+
+    2. 文件存在，但第一行不是正确的表头（说明被污染了，比如某条真实数据
+       被误当成表头写了进去）→ 不再对着一个坏文件默默地逐行跳过、印一堆
+       看不出问题本质的小警告。而是：
+       - 打印一条非常显眼、独立成块的严重错误日志，说清楚"表头污染了"这件事
+       - 把损坏的文件原样备份一份（不删除任何数据，留档方便你事后查）
+       - 把被误当表头的那一行当成一条正常数据，重建一份表头正确的新文件
+
+    这两件事对应的是你提的两个需求：数据格式跟预期不一致时要报出来（不是
+    默默跳过）、数据在运行期间消失了程序自己也要能意识到并且有动静。
+    """
     if not os.path.exists(CSV_PATH):
+        print(f"ℹ️  明细表({CSV_PATH})不存在，正在创建一个带正确表头的新文件。"
+              f"如果你预期这里应该已经有数据，说明文件是刚刚才消失的，这不是正常情况，值得你去确认一下原因。")
         with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(CSV_HEADER)
+        return
+
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            first_row = None  # 文件存在但完全是空的（连表头都没有）
+
+    if first_row == CSV_HEADER:
+        return  # 表头正常，什么都不用做
+
+    print("=" * 70)
+    print("🚨 严重警告：明细表的表头被污染了，不是正常状态！")
+    print(f"   期望的表头: {CSV_HEADER}")
+    print(f"   实际读到的第一行: {first_row}")
+    print("   这通常发生在：程序运行期间文件被外部删除、但程序没有重启，")
+    print("   之后有新数据被追加写入时，本该是表头的位置被一条真实数据占据了。")
+    print("   正在自动修复：备份损坏文件 → 用正确表头重建 → 把误当表头的那行当普通数据保留。")
+    print("=" * 70)
+
+    backup_path = f"{CSV_PATH}.corrupted-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        original_content = f.read()
+    with open(backup_path, "w", newline="", encoding="utf-8-sig") as f:
+        f.write(original_content)
+    print(f"   已备份损坏文件到: {backup_path}（不会自动删除，你可以手动检查里面的内容）")
+
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        all_rows = list(reader)  # 第一行(被误当表头的数据)也在里面，会被当普通数据处理
+
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADER)
+        kept = 0
+        for row in all_rows:
+            if len(row) == len(CSV_HEADER):
+                writer.writerow(row)
+                kept += 1
+            else:
+                print(f"   ⚠️  有一行列数对不上（{len(row)}列，期望{len(CSV_HEADER)}列），已丢弃: {row}")
+
+    print(f"   修复完成，重建了正确表头，保留了 {kept} 行数据。")
+    print("=" * 70)
 
 
 def append_entry(food_id, food_item, servings):
+    ensure_csv_exists()  # 每次写入前都检查一遍，不能只信任"启动时已经检查过"——
+    # 如果文件在程序运行期间被外部删除（比如你去Shell里手动删了），
+    # 下次追加写入会创建一个没有表头的文件，后面所有读取都会被污染。
     now = datetime.now()
     entry_id = uuid.uuid4().hex[:10]
     with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
@@ -276,6 +343,7 @@ def get_entries_for_date(date_str):
     用于"历史数据编辑"功能——用户选一天，看到那天具体吃了什么，可以单条删除或改份数。
     """
     entries = []
+    ensure_csv_exists()
     if not os.path.exists(CSV_PATH):
         return entries
     with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
@@ -436,6 +504,9 @@ def compute_all_daily_totals():
     （这在你手动编辑明细表时尤其重要，一行格式错了不该影响其它所有天的数据）。
     """
     totals_by_date = {}
+    ensure_csv_exists()  # 每次读取前先检查表头完整性，不只是写入前才检查——
+    # 这样哪怕用户只是打开页面看图表、没有点任何写入类按钮，也能第一时间
+    # 发现并修复文件被外部删除/损坏的情况，而不是要等到下次写入才触发检查。
     if not os.path.exists(CSV_PATH):
         return totals_by_date
 
