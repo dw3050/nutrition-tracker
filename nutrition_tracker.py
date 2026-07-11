@@ -7,75 +7,10 @@
 """
 
 import csv
+import json
 import os
+import uuid
 from datetime import datetime, timedelta
-
-# ---------------------------------------------------------------------------
-# 食物库：每份的营养成分（可自行修改这里的数值）
-# 格式: "名称": (卡路里, 蛋白质g, 碳水g, 脂肪g)
-#
-# 数据可信度说明（2026-07-03 核实）：
-# 1. 煎鸡蛋：USDA基准90kcal/6.26g蛋白/6.83g脂肪/0.38g碳水较可靠；
-#    因你用橄榄油且油量偏多，额外加了约20-25kcal/2g脂肪的估算值。
-#    误差带 ±20kcal，主要不确定性来自实际用油量，不是鸡蛋本身。
-# 2. 无糖燕麦粥：130kcal为你提供的产品已知值，直接采用；
-#    蛋白/碳水/脂肪拆分按USDA纯燕麦干重宏量比例（17%/67%/16%热量占比）反推，
-#    不是你实际产品的实测值。如果产品有额外配料（蛋白粉/坚果等），误差会更大。
-# 3. 水煮虾：基于你提供的Bowen Basket包装数据(4oz/112g=80kcal/15g蛋白/
-#    170mg胆固醇/570mg钠)，按10只虾≈128g生重换算。
-#    ⚠️ 重要发现：换算成每100g后，蛋白质(13.4g)明显低于USDA天然生虾(20.1g)，
-#    钠(509mg)是天然虾肉本身钠含量(约224mg)的两倍多——大概率是"增强/腌渍虾"
-#    (注水+盐水/磷酸盐工艺)，不是纯虾肉。水煮后实际摄入钠可能因溶出流失10-30%，
-#    脂肪含量包装上未提供，暂标"待核实"，不要完全当真。
-# 4. 蛋白粉：⚠️ 未验证——没有具体品牌/规格信息，无法查证，以下为行业通用估算，
-#    误差可能达到±50%甚至更高。强烈建议提供实际包装信息后替换此项。
-# 5. 冷冻蔬菜包(微波即食,含芝士调味)：⚠️ 低可信度——你说明了"每袋配料不固定"，
-#    没有单一产品可查证。以下数值是参照同类"冷冻蔬菜+芝士酱"产品的宏量比例，
-#    按你提供的150kcal换算得来，不是你实际那一袋的实测值，仅供大致参考。
-# ---------------------------------------------------------------------------
-FOODS = {
-    # 数据可信度说明（原本写在显示名称里的标注，现在移到这里——
-    # 删掉显示名称上的括号标注是纯UI清理，不代表这些数据变得更可信了，
-    # 该有的保留度还是要保留，只是不再刷在你每天看到的界面上）：
-    #
-    # 1. 煎鸡蛋：用橄榄油煎、油量偏多，误差±20kcal，主要不确定性来自实际用油量。
-    # 4. 蛋白粉：⚠️ 仍未验证——没有具体品牌/规格信息，以下是行业通用估算，
-    #    误差可能达到±50%甚至更高。你现在把它加到2份/天，等于在一个未验证的
-    #    数字上加倍下注，等你哪天把包装发我，这个数字大概率要整体重算。
-    # 5. 冷冻蔬菜包：品牌已确认是Birds Eye Steamfresh。已用真实产品数据修正
-    #    （之前的150kcal/6g蛋白是错的，用错了参考产品）。目标份数锁定1份/天，
-    #    这是你的现实食量上限，不再往上调。
-    # 6. 鸡胸肉：数据来源USDA生鸡胸肉每100g=114kcal/21.2g蛋白/2.6g脂肪，
-    #    按你说的"盒子上的生重"换算到1磅。目标份数锁定1磅/天，不再往上调
-    #    （你明确说过一天超过1磅吃不下）。
-    # 7/8. 香蕉、牛油果：为了补钾加入的两项。数据来源USDA标准中等大小份量
-    #    （香蕉118g、牛油果整个约201g）。这两项加起来能把每日钾摄入覆盖率
-    #    从原来接近0提到大约37%-47%，仍有明显缺口，不是"解决方案"，
-    #    是"性价比最高的部分缓解"，你自己决定这个覆盖率够不够。
-    "1": {"name": "煎鸡蛋",     "unit": "1个",  "kcal": 115, "protein": 6.3,  "carb": 0.4,  "fat": 9},
-    "2": {"name": "无糖燕麦粥", "unit": "1份",  "kcal": 130, "protein": 5.5,  "carb": 21.8, "fat": 2.3},
-    "3": {"name": "水煮虾",     "unit": "10只", "kcal": 91,  "protein": 17,   "carb": 0,    "fat": 0.8},
-    "4": {"name": "蛋白粉",     "unit": "1勺",  "kcal": 120, "protein": 24,   "carb": 3,    "fat": 1},
-    "5": {"name": "冷冻蔬菜包", "unit": "1袋",  "kcal": 100, "protein": 3.3,  "carb": 18.3, "fat": 1.7},
-    "6": {"name": "鸡胸肉",     "unit": "1磅",  "kcal": 517, "protein": 96.2, "carb": 0,    "fat": 11.8},
-    "7": {"name": "香蕉",       "unit": "1根",  "kcal": 105, "protein": 1.3,  "carb": 27,   "fat": 0.4},
-    "8": {"name": "牛油果",     "unit": "1个",  "kcal": 322, "protein": 4,    "carb": 17,   "fat": 29.5},
-    # 9. 额外热量：不是真实食物，是给计划外饮食用的热量补记项。
-    #    单份定义为1卡路里，所以你输入的数字就直接是总热量，不需要换算。
-    #    蛋白质/碳水/脂肪都设成0——这里只管热量，不追踪其他营养素，
-    #    这是你明确说过不需要管的。
-    "9": {"name": "额外热量",   "unit": "1卡",  "kcal": 1,   "protein": 0,    "carb": 0,    "fat": 0},
-}
-
-# 用于图表里判断"今天是否吃了蔬菜"时匹配的食物名称
-VEGETABLE_FOOD_NAME = FOODS["5"]["name"]
-
-# 每日目标（用于柱状图里画目标线）
-# 注意：这两个数字不因为鸡胸肉份量的不确定性而调整——它们是根据体重/身高/
-# 年龄/活动量/减脂速率算出来的独立生理需求值，跟某一种食物一份到底是1.1磅
-# 还是1.4磅没有因果关系，不应该因为后者去反推调整前者。
-DAILY_KCAL_TARGET = 1800
-DAILY_PROTEIN_TARGET = 200
 
 # 数据文件存放目录。
 # 本地跑（不设置NUTRITION_DATA_DIR环境变量）时，跟以前一样存在脚本所在文件夹。
@@ -84,8 +19,162 @@ DAILY_PROTEIN_TARGET = 200
 DATA_DIR = os.environ.get("NUTRITION_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# 食物库 —— 现在存在 foods.json 里，不再是写死在代码里的字典。
+#
+# 这是个真实的架构改动，不是小修小补：之前想加一种食物、改一个数值，
+# 必须我来改Python代码。现在食物目录是数据，不是代码，网页上"管理食物"
+# 那个功能可以直接读写这个文件，加菜、改营养值都不需要碰代码了。
+#
+# _DEFAULT_FOODS 是"种子数据"——只在 foods.json 还不存在的时候（比如你
+# 第一次部署、或者本地第一次跑）用来初始化这个文件，之后 foods.json 才是
+# 真正的数据来源，这份写死的字典不会再被读取。
+#
+# 数据可信度说明（保留作为历史记录，2026-07-03至2026-07-11期间陆续核实）：
+# 1. 煎鸡蛋：用橄榄油煎、油量偏多，误差±20kcal，主要不确定性来自实际用油量。
+# 3. 水煮虾：基于Bowen Basket包装数据换算，蛋白质密度低于天然虾、钠偏高，
+#    大概率是"增强/腌渍虾"，脂肪含量未在包装上给出，是估算值。
+# 4. 蛋白粉：⚠️ 从头到尾未验证——没有具体品牌/规格信息，是行业通用估算，
+#    误差可能达到±50%甚至更高。
+# 5. 冷冻蔬菜包：品牌已确认Birds Eye Steamfresh，已用真实产品数据修正。
+# 6. 鸡胸肉：数据来源USDA生鸡胸肉每100g=114kcal/21.2g蛋白/2.6g脂肪，
+#    按盒子上标的生重换算到1磅。
+# 7/8. 香蕉、牛油果：为补钾加入，数据来源USDA标准中等大小份量。
+# ---------------------------------------------------------------------------
+FOODS_PATH = os.path.join(DATA_DIR, "foods.json")
+
+_DEFAULT_FOODS = {
+    "1": {"name": "煎鸡蛋",     "unit": "1个",  "kcal": 115, "protein": 6.3,  "carb": 0.4,  "fat": 9},
+    "2": {"name": "无糖燕麦粥", "unit": "1份",  "kcal": 130, "protein": 5.5,  "carb": 21.8, "fat": 2.3},
+    "3": {"name": "水煮虾",     "unit": "10只", "kcal": 91,  "protein": 17,   "carb": 0,    "fat": 0.8},
+    "4": {"name": "蛋白粉",     "unit": "1勺",  "kcal": 120, "protein": 24,   "carb": 3,    "fat": 1},
+    "5": {"name": "冷冻蔬菜包", "unit": "1袋",  "kcal": 100, "protein": 3.3,  "carb": 18.3, "fat": 1.7},
+    "6": {"name": "鸡胸肉",     "unit": "1磅",  "kcal": 517, "protein": 96.2, "carb": 0,    "fat": 11.8},
+    "7": {"name": "香蕉",       "unit": "1根",  "kcal": 105, "protein": 1.3,  "carb": 27,   "fat": 0.4},
+    "8": {"name": "牛油果",     "unit": "1个",  "kcal": 322, "protein": 4,    "carb": 17,   "fat": 29.5},
+    "9": {"name": "额外热量",   "unit": "1卡",  "kcal": 1,   "protein": 0,    "carb": 0,    "fat": 0},
+}
+
+
+def _load_foods_file():
+    """
+    读取foods.json。文件里存的不只是食物字典，还有一个next_id计数器。
+    这个计数器只增不减，即使某个食物被删除了，它的编号也永远不会被
+    分配给之后新加的食物——这是防止"删掉旧鸡肉、新建同名鸡肉"这种情况下
+    新食物意外顶替旧食物历史身份的关键。
+
+    兼容旧格式：如果读到的是没有next_id包装的老版本文件（纯食物字典），
+    自动从当前最大编号推算一个初始计数器值，然后重存成新格式。
+    """
+    if not os.path.exists(FOODS_PATH):
+        foods = dict(_DEFAULT_FOODS)
+        next_id = max((int(k) for k in foods if k.isdigit()), default=0) + 1
+        _save_foods_file(foods, next_id)
+        return foods, next_id
+
+    with open(FOODS_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "next_id" in data and "foods" in data:
+        return data["foods"], data["next_id"]
+
+    # 老格式迁移：整个文件本身就是食物字典
+    foods = data
+    next_id = max((int(k) for k in foods if k.isdigit()), default=0) + 1
+    _save_foods_file(foods, next_id)
+    return foods, next_id
+
+
+def _save_foods_file(foods_dict, next_id):
+    with open(FOODS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"next_id": next_id, "foods": foods_dict}, f, ensure_ascii=False, indent=2)
+
+
+FOODS, _NEXT_FOOD_ID = _load_foods_file()
+
+
+def _save_foods():
+    _save_foods_file(FOODS, _NEXT_FOOD_ID)
+
+
+def add_food(name, unit, kcal, protein, carb, fat):
+    """新增一种食物，用只增不减的计数器分配id，绝不会跟历史上曾经存在过、哪怕已被删除的食物撞号。"""
+    global _NEXT_FOOD_ID
+    new_id = str(_NEXT_FOOD_ID)
+    FOODS[new_id] = {
+        "name": name, "unit": unit,
+        "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
+    }
+    _NEXT_FOOD_ID += 1
+    _save_foods()
+    return new_id
+
+
+def update_food(food_id, name, unit, kcal, protein, carb, fat):
+    """
+    修改某个食物的定义（名字/单位/营养值），并把这个改动同步应用到
+    这个食物已有的所有历史记录上——按你的要求，"编辑"代表的是同一个食物
+    的定义在演进，不是变成了另一个东西，所以历史记录应该跟着新定义重算，
+    而不是继续保留编辑前的旧快照。
+
+    这跟"删除后新建同名食物"是两回事：那种情况新食物拿到的是全新id，
+    跟旧食物的历史记录没有任何关联，不会互相影响——这是本函数不需要
+    额外处理的部分，因为id不同，天然不会匹配到旧食物的历史记录。
+
+    返回 (是否成功, 被同步更新的历史记录条数)。
+    """
+    if food_id not in FOODS:
+        return False, 0
+    FOODS[food_id] = {
+        "name": name, "unit": unit,
+        "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
+    }
+    _save_foods()
+    updated_count = recompute_entries_for_food(food_id)
+    return True, updated_count
+
+
+def delete_food(food_id):
+    """
+    删除一个食物定义。它已有的历史记录不会被删除、不会被改动，
+    继续保留删除前最后一次的营养快照——只是这个食物不再出现在
+    "记录今天吃了什么"的清单里，也没法再通过管理食物界面编辑它了。
+    它的id从此永久退休，不会被后续新增的食物复用（见add_food的计数器逻辑）。
+    """
+    if food_id not in FOODS:
+        return False
+    del FOODS[food_id]
+    _save_foods()
+    return True
+
+
+def get_vegetable_food_name():
+    """
+    动态读取"蔬菜"这个食物当前的名字，不能用一个写死的常量缓存，
+    因为现在食物名字可以通过网页随时被改，缓存下来的名字会过时，
+    导致"今天吃了蔬菜没"这个判断悄悄失效。
+    """
+    return FOODS.get("5", {}).get("name", "")
+
+
+# 每日目标（用于柱状图里画目标线）
+# 注意：这两个数字不因为鸡胸肉份量的不确定性而调整——它们是根据体重/身高/
+# 年龄/活动量/减脂速率算出来的独立生理需求值，跟某一种食物一份到底是1.1磅
+# 还是1.4磅没有因果关系，不应该因为后者去反推调整前者。
+DAILY_KCAL_TARGET = 1800
+DAILY_PROTEIN_TARGET = 200
+
 CSV_PATH = os.path.join(DATA_DIR, "nutrition_log.csv")
-CSV_HEADER = ["date", "time", "food", "servings", "kcal", "protein_g", "carb_g", "fat_g"]
+# 加了 id 和 food_id 两列——之前的版本没有任何方式能精确定位"某一条具体记录"，
+# 只能整天清空重来。要支持"撤回上一条"和"编辑某一天的某一条记录"，
+# 每条记录必须有唯一ID，而且要记住它对应哪个食物(food_id)，
+# 不能只存食物名字——名字以后可能会改，id不会变。
+#
+# ⚠️ 迁移说明：如果你在Render上已经跑了一段时间、攒了一些用旧格式(没有id/food_id
+# 这两列)记录的数据，这些旧记录在读取时id/food_id会是空——旧记录仍然会被正确计入
+# 每天的热量/蛋白质汇总(那部分逻辑不依赖这两个新列)，但没法通过"撤回"或"编辑"
+# 功能精确操作，因为程序找不到它们的id。这不是bug，是新旧数据结构交接的必然结果。
+CSV_HEADER = ["id", "date", "time", "food", "food_id", "servings", "kcal", "protein_g", "carb_g", "fat_g"]
 
 # 第二份CSV：每天一行的汇总（只含热量/蛋白质/碳水，按你的要求不含脂肪）
 SUMMARY_CSV_PATH = os.path.join(DATA_DIR, "nutrition_daily_summary.csv")
@@ -99,20 +188,24 @@ def ensure_csv_exists():
             writer.writerow(CSV_HEADER)
 
 
-def append_entry(food_item, servings):
+def append_entry(food_id, food_item, servings):
     now = datetime.now()
+    entry_id = uuid.uuid4().hex[:10]
     with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
+            entry_id,
             now.strftime("%Y-%m-%d"),
             now.strftime("%H:%M:%S"),
             food_item["name"],
+            food_id,
             servings,
             round(food_item["kcal"] * servings, 1),
             round(food_item["protein"] * servings, 1),
             round(food_item["carb"] * servings, 1),
             round(food_item["fat"] * servings, 1),
         ])
+    return entry_id
 
 
 def clear_today_entries():
@@ -139,6 +232,171 @@ def clear_today_entries():
         writer.writeheader()
         for row in kept_rows:
             writer.writerow(row)
+
+
+def undo_last_entry():
+    """
+    撤销"今天"最后添加的一条记录。
+    做法：读出今天的所有行，按文件里的顺序（也就是记录的时间顺序，因为
+    append_entry永远是往文件末尾追加）取最后一条，删掉它，其余原样保留。
+    返回被删除的那条记录（方便调用方告诉用户"撤销了什么"），
+    如果今天没有任何记录，返回None。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if not os.path.exists(CSV_PATH):
+        return None
+
+    all_rows = []
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            all_rows.append(row)
+
+    # 找到"今天"的行里，最后一条的位置
+    today_indices = [i for i, row in enumerate(all_rows) if row.get("date") == today]
+    if not today_indices:
+        return None
+
+    last_idx = today_indices[-1]
+    removed = all_rows.pop(last_idx)
+
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+    return removed
+
+
+def get_entries_for_date(date_str):
+    """
+    返回某一天的所有明细记录，按时间顺序，每条带上id方便前端定位删除/编辑。
+    用于"历史数据编辑"功能——用户选一天，看到那天具体吃了什么，可以单条删除或改份数。
+    """
+    entries = []
+    if not os.path.exists(CSV_PATH):
+        return entries
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("date") == date_str:
+                entries.append(row)
+    return entries
+
+
+def delete_entry_by_id(entry_id):
+    """按id删除明细表里的某一条具体记录，其余不受影响。返回是否真的删到了。"""
+    if not os.path.exists(CSV_PATH):
+        return False
+
+    all_rows = []
+    found = False
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("id") == entry_id:
+                found = True
+                continue
+            all_rows.append(row)
+
+    if not found:
+        return False
+
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+    return True
+
+
+def recompute_entries_for_food(food_id):
+    """
+    用food_id当前的定义，重新计算明细表里所有属于这个食物的历史记录。
+    改的字段包括食物名字（如果食物改名了，历史记录里显示的名字也同步更新，
+    因为这仍然是"同一个食物"，只是名字变了，不应该新旧记录显示两个名字）
+    和营养数值。份数(servings)本身不变——只重算"份数 × 单份营养值"这个结果。
+    返回被更新的记录条数，方便调用方告诉用户"同步改了几条"。
+    """
+    if food_id not in FOODS:
+        return 0
+    food_item = FOODS[food_id]
+
+    if not os.path.exists(CSV_PATH):
+        return 0
+
+    all_rows = []
+    updated_count = 0
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("food_id") == food_id:
+                try:
+                    servings = float(row["servings"])
+                except (TypeError, ValueError, KeyError):
+                    all_rows.append(row)
+                    continue
+                row["food"] = food_item["name"]
+                row["kcal"] = round(food_item["kcal"] * servings, 1)
+                row["protein_g"] = round(food_item["protein"] * servings, 1)
+                row["carb_g"] = round(food_item["carb"] * servings, 1)
+                row["fat_g"] = round(food_item["fat"] * servings, 1)
+                updated_count += 1
+            all_rows.append(row)
+
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+    return updated_count
+
+
+def update_entry_servings(entry_id, new_servings):
+    """
+    修改某一条具体记录的份数，并按food_id重新查表算出对应的热量/蛋白/碳水/脂肪。
+    这就是为什么明细表要存food_id而不只是食物名字——改份数需要知道
+    "这条记录对应的是哪个食物"，才能按新份数重新算出正确的营养值。
+    如果这条记录是旧数据、没有food_id（迁移前的历史记录），没法安全重算，
+    直接返回失败，不做任何猜测性的处理。
+    """
+    if not os.path.exists(CSV_PATH):
+        return False
+
+    all_rows = []
+    target_row = None
+    with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("id") == entry_id:
+                target_row = row
+            all_rows.append(row)
+
+    if target_row is None:
+        return False
+
+    food_id = target_row.get("food_id")
+    if not food_id or food_id not in FOODS:
+        return False  # 旧数据没有food_id，或者food_id对应的食物已经不存在了，不做猜测性修改
+
+    food_item = FOODS[food_id]
+    target_row["servings"] = new_servings
+    target_row["kcal"] = round(food_item["kcal"] * new_servings, 1)
+    target_row["protein_g"] = round(food_item["protein"] * new_servings, 1)
+    target_row["carb_g"] = round(food_item["carb"] * new_servings, 1)
+    target_row["fat_g"] = round(food_item["fat"] * new_servings, 1)
+
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+    return True
 
 
 def get_today_total():
@@ -266,7 +524,7 @@ def get_vegetable_days():
     with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("food") == VEGETABLE_FOOD_NAME:
+            if row.get("food") == get_vegetable_food_name():
                 veg_days.add(row["date"])
     return veg_days
 
@@ -386,7 +644,7 @@ def main():
 
     recorded_items = []
 
-    for item in FOODS.values():
+    for food_id, item in FOODS.items():
         while True:
             qty_str = input(f"{item['name']}（{item['unit']}/份）吃了几份？回车=没吃: ").strip()
 
@@ -404,7 +662,7 @@ def main():
                 print("⚠️  份数必须大于0，或直接回车跳过。")
                 continue
 
-            append_entry(item, servings)
+            append_entry(food_id, item, servings)
             recorded_items.append(f"{item['name']} x{servings}份")
             break
 

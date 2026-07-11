@@ -14,6 +14,8 @@
 
 import json
 import os
+import secrets
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -21,6 +23,73 @@ from urllib.parse import urlparse, parse_qs
 import nutrition_tracker as nt
 
 PORT = 8420
+
+# ---------------------------------------------------------------------------
+# 登录验证（session cookie + 密码，允许多个人各自有自己的账号）
+#
+# 用的是"服务端session token + HttpOnly cookie"这套机制——这是几乎所有网站
+# 登录功能底层都在用的标准做法（哪怕是Google登录，最后一步落地也是这个），
+# 不是简化版或者不入流的方案。跟"真正的OAuth第三方登录(比如Google一键登录)"
+# 相比，区别只在于"验证密码"这一步是自己比对，不是交给Google去验证——
+# OAuth更"标准"，但需要去Google Cloud Console注册应用、处理回调地址这些
+# 额外步骤，对你这个个人小工具来说投入产出不成正比，先用这一版。
+#
+# 账号通过环境变量NUTRITION_USERS配置，格式："用户名1:密码1,用户名2:密码2"
+# 比如 NUTRITION_USERS=dongyao:某个密码,friend:另一个密码
+# 想让谁能访问，就把谁的账号密码加进这个环境变量，想收回权限，删掉对应那段就行。
+#
+# 本地跑（没设置这个环境变量）时，不启用登录验证，效果跟以前一样直接能用。
+# ---------------------------------------------------------------------------
+def _parse_users(raw):
+    users = {}
+    if not raw:
+        return users
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        user, _, pw = pair.partition(":")
+        users[user.strip()] = pw.strip()
+    return users
+
+
+AUTH_USERS = _parse_users(os.environ.get("NUTRITION_USERS", ""))
+AUTH_ENABLED = bool(AUTH_USERS)
+
+# 部署到Render(有PORT环境变量)时用HTTPS，cookie加Secure标记更安全；
+# 本地用http://localhost跑的时候，浏览器不会通过明文HTTP发送Secure cookie，
+# 所以本地必须不加这个标记，否则登录会莫名其妙一直失败。
+SECURE_COOKIE = "PORT" in os.environ
+
+SESSION_TTL_SECONDS = 30 * 24 * 3600  # session有效期30天，不用每次打开都重新登录
+_sessions = {}  # token -> {"user": 用户名, "expires": 过期时间戳}
+
+
+def _create_session(username):
+    token = secrets.token_hex(24)
+    _sessions[token] = {"user": username, "expires": time.time() + SESSION_TTL_SECONDS}
+    return token
+
+
+def _get_session_user(token):
+    session = _sessions.get(token)
+    if not session:
+        return None
+    if session["expires"] < time.time():
+        _sessions.pop(token, None)
+        return None
+    return session["user"]
+
+
+def _parse_cookies(header_value):
+    cookies = {}
+    if not header_value:
+        return cookies
+    for part in header_value.split(";"):
+        if "=" in part:
+            k, _, v = part.strip().partition("=")
+            cookies[k] = v
+    return cookies
 
 
 def get_week_payload(days=7):
@@ -57,6 +126,8 @@ def get_foods_list():
             "unit": item["unit"],
             "kcal": item["kcal"],
             "protein": item["protein"],
+            "carb": item["carb"],
+            "fat": item["fat"],
             "eaten_today": eaten_today.get(food_id, 0.0),
         }
         for food_id, item in nt.FOODS.items()
@@ -77,7 +148,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>饮食记录</title>
 <style>
   :root {
@@ -92,6 +163,9 @@ HTML_PAGE = """<!DOCTYPE html>
     --track: #eeece3;
     --danger: #b1543f;
     --danger-flash: #f5e8e4;
+    --modal-bg: #fbf3e6;
+    --modal-border: #e8d3a8;
+    --modal-accent: #b8863d;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -115,19 +189,35 @@ HTML_PAGE = """<!DOCTYPE html>
     padding: 18px 20px;
   }
 
+  .top-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .btn-small {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--ink-soft);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 6px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .btn-small:hover { background: var(--flash); }
   .clear-btn {
     background: transparent;
     border: 1px solid var(--danger);
     color: var(--danger);
     font-family: inherit;
     font-size: 11px;
-    padding: 5px 10px;
+    padding: 6px 10px;
     border-radius: 5px;
     cursor: pointer;
-    transition: background 0.15s ease;
-    margin-left: auto;
   }
   .clear-btn:hover { background: var(--danger-flash); }
+  .logout-btn { margin-left: auto; }
 
   .section-label {
     color: var(--ink-soft);
@@ -217,7 +307,7 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--ink-soft);
     font-family: inherit;
     font-size: 12px;
-    padding: 5px 10px;
+    padding: 6px 10px;
     border-radius: 5px;
     cursor: pointer;
   }
@@ -227,48 +317,61 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #fffefb;
   }
   .days-input {
-    width: 84px;
+    width: 100px;
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--ink);
     font-family: inherit;
     font-size: 12px;
-    padding: 5px 8px;
+    padding: 6px 8px;
     border-radius: 5px;
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+  .days-input::-webkit-inner-spin-button,
+  .days-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 
   .food-row {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 7px 6px;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    padding: 10px 6px;
     border-radius: 4px;
+    border-bottom: 1px solid var(--border);
     transition: background 0.5s ease;
   }
+  .food-row:last-child { border-bottom: none; }
   .food-row.flash { background: var(--flash); }
-  .food-info { flex: 1; min-width: 0; }
-  .food-name { color: var(--ink); font-size: 13.5px; }
+  .food-info { flex: 1 1 100%; min-width: 0; }
+  .food-name { color: var(--ink); font-size: 14px; }
   .food-meta { color: var(--ink-soft); font-size: 11.5px; margin-top: 1px; }
 
+  .food-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+  }
   .food-progress {
-    width: 32px;
-    flex-shrink: 0;
+    min-width: 26px;
     text-align: right;
     font-size: 13px;
     font-weight: 600;
     color: var(--sage);
-    margin-right: 14px;
+    margin-right: 4px;
   }
-
   .food-input {
-    width: 52px;
+    width: 58px;
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--ink);
     font-family: inherit;
-    font-size: 14px;
-    padding: 5px 7px;
+    font-size: 15px;
+    padding: 8px 8px;
     border-radius: 5px;
     text-align: right;
     -moz-appearance: textfield;
@@ -284,11 +387,284 @@ HTML_PAGE = """<!DOCTYPE html>
     border-color: var(--sage-dim);
     box-shadow: 0 0 0 2px rgba(95,138,114,0.15);
   }
+  .add-btn, .plus-btn {
+    background: var(--sage);
+    color: #fffefb;
+    border: none;
+    font-family: inherit;
+    font-weight: 600;
+    border-radius: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .add-btn:hover, .plus-btn:hover { background: var(--sage-dim); }
+  .add-btn {
+    font-size: 16px;
+    width: 38px;
+    height: 38px;
+  }
+  .plus-btn {
+    font-size: 12px;
+    padding: 8px 10px;
+    height: 38px;
+    white-space: nowrap;
+  }
 
+  /* ---- 弹窗（编辑历史 / 管理食物 共用），刻意用跟主界面不同的暖色调，
+     让人一眼分辨"我现在不是在做日常记录，是在改历史/改食物库" ---- */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(60, 55, 40, 0.35);
+    align-items: flex-start;
+    justify-content: center;
+    padding: 24px 12px;
+    overflow-y: auto;
+    z-index: 100;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal-box {
+    width: 100%;
+    max-width: 640px;
+    background: var(--modal-bg);
+    border: 1px solid var(--modal-border);
+    border-radius: 10px;
+    padding: 18px 20px 22px;
+  }
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .modal-title {
+    font-size: 13px;
+    color: var(--modal-accent);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .modal-close-btn {
+    background: transparent;
+    border: 1px solid var(--modal-accent);
+    color: var(--modal-accent);
+    font-family: inherit;
+    font-size: 13px;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .modal-close-btn:hover { background: rgba(184,134,61,0.12); }
+
+  .day-editor-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .date-input {
+    background: #fffefb;
+    border: 1px solid var(--modal-border);
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 7px 9px;
+    border-radius: 5px;
+  }
+  .entry-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    padding: 9px 6px;
+    border-bottom: 1px solid var(--modal-border);
+  }
+  .entry-row:last-child { border-bottom: none; }
+  .entry-info { flex: 1 1 auto; min-width: 120px; }
+  .entry-name { font-size: 13.5px; color: var(--ink); }
+  .entry-meta { font-size: 11px; color: var(--ink-soft); }
+  .entry-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .entry-input {
+    width: 56px;
+    background: #fffefb;
+    border: 1px solid var(--modal-border);
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 7px;
+    border-radius: 5px;
+    text-align: right;
+  }
+  .entry-save-btn {
+    background: var(--modal-accent);
+    color: #fffefb;
+    border: none;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 6px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .entry-save-btn:hover { opacity: 0.85; }
+  .entry-delete-btn {
+    background: transparent;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 6px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .entry-delete-btn:hover { background: var(--danger-flash); }
+  .empty-note { color: var(--ink-soft); font-size: 12px; padding: 8px 6px; }
+
+  /* 待确认的改动：先给出明显的视觉标记，真正提交要等点了"确认修改" */
+  .entry-row.pending-edit {
+    background: rgba(184, 134, 61, 0.10);
+    border-left: 3px solid var(--modal-accent);
+    padding-left: 8px;
+  }
+  .entry-row.pending-delete {
+    background: var(--danger-flash);
+    border-left: 3px solid var(--danger);
+    padding-left: 8px;
+    opacity: 0.6;
+  }
+  .entry-row.pending-delete .entry-name { text-decoration: line-through; }
+
+  .confirm-history-btn {
+    width: 100%;
+    margin-top: 14px;
+    background: var(--modal-accent);
+    color: #fffefb;
+    border: none;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 13px;
+    padding: 11px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .confirm-history-btn:hover:not(:disabled) { opacity: 0.85; }
+  .confirm-history-btn:disabled {
+    background: var(--track);
+    color: var(--ink-soft);
+    cursor: not-allowed;
+  }
+
+
+  /* ---- 管理食物弹窗 ---- */
+  .food-edit-row {
+    padding: 10px 6px;
+    border-bottom: 1px solid var(--modal-border);
+  }
+  .food-edit-row:last-child { border-bottom: none; }
+  .food-edit-name-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+  }
+  .food-edit-name { font-size: 13.5px; color: var(--ink); }
+  .food-edit-meta { font-size: 11px; color: var(--ink-soft); margin-top: 1px; }
+  .food-edit-toggle { color: var(--modal-accent); font-size: 12px; }
+  .food-edit-form {
+    display: none;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .food-edit-form.open { display: grid; }
+  .food-edit-form label {
+    font-size: 10.5px;
+    color: var(--ink-soft);
+    display: block;
+    margin-bottom: 2px;
+  }
+  .food-edit-form input {
+    width: 100%;
+    background: #fffefb;
+    border: 1px solid var(--modal-border);
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 5px;
+  }
+  .food-edit-form .full-width { grid-column: 1 / -1; }
+  .food-edit-save-btn {
+    grid-column: 1 / -1;
+    background: var(--modal-accent);
+    color: #fffefb;
+    border: none;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 9px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-top: 2px;
+  }
+  .food-edit-save-btn:hover { opacity: 0.85; }
+  .food-edit-delete-btn {
+    grid-column: 1 / -1;
+    background: transparent;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 7px;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-top: 2px;
+  }
+  .food-edit-delete-btn:hover { background: var(--danger-flash); }
+  .add-food-section {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--modal-border);
+  }
+  .add-food-label {
+    font-size: 11px;
+    color: var(--modal-accent);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  /* 手机屏幕适配：字号、间距、触控区域都放大一档，避免误触和看不清 */
+  @media (max-width: 480px) {
+    body { padding: 10px 8px; }
+    .panel, .modal-box { padding: 14px 12px; border-radius: 6px; }
+    .food-name { font-size: 15px; }
+    .food-meta { font-size: 12px; }
+    .food-input { font-size: 16px; width: 64px; padding: 10px 8px; }
+    .add-btn { width: 42px; height: 42px; font-size: 18px; }
+    .plus-btn { height: 42px; font-size: 13px; padding: 10px 12px; }
+    .range-btn, .btn-small, .clear-btn { font-size: 12.5px; padding: 8px 12px; }
+    .bar-label { width: 38px; font-size: 11px; }
+    .bar-value { width: 40px; font-size: 11px; }
+    .food-edit-form { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
   <div class="panel">
+
+    <div class="top-bar">
+      <button class="btn-small" id="undo-btn">撤回上一步</button>
+      <button class="clear-btn" id="clear-btn">清空今天</button>
+      <button class="btn-small" id="open-history-btn">编辑历史</button>
+      <button class="btn-small" id="open-foods-btn">管理食物</button>
+      __LOGOUT_BUTTON__
+    </div>
 
     <div class="section-label">显示范围</div>
     <div class="range-picker">
@@ -296,7 +672,6 @@ HTML_PAGE = """<!DOCTYPE html>
       <button class="range-btn" data-days="30">30天</button>
       <button class="range-btn" data-days="60">60天</button>
       <input type="number" id="custom-days" class="days-input" placeholder="自定义天数" min="1" max="365">
-      <button class="clear-btn" id="clear-btn">清空今天</button>
     </div>
 
     <div class="section-label" id="range-title">过去 7 天</div>
@@ -308,12 +683,53 @@ HTML_PAGE = """<!DOCTYPE html>
 
   </div>
 
+  <!-- ---- 编辑历史 弹窗 ---- -->
+  <div class="modal-overlay" id="history-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div class="modal-title">编辑历史</div>
+        <button class="modal-close-btn" id="close-history-btn">✕</button>
+      </div>
+      <div class="day-editor-controls">
+        <input type="date" id="edit-date" class="date-input">
+        <button class="btn-small" id="load-day-btn">查看</button>
+      </div>
+      <div id="day-entries"></div>
+      <button class="confirm-history-btn" id="confirm-history-btn" disabled>确认修改</button>
+    </div>
+  </div>
+
+  <!-- ---- 管理食物 弹窗 ---- -->
+  <div class="modal-overlay" id="foods-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div class="modal-title">管理食物</div>
+        <button class="modal-close-btn" id="close-foods-btn">✕</button>
+      </div>
+      <div id="food-edit-list"></div>
+
+      <div class="add-food-section">
+        <div class="add-food-label">+ 添加新食物</div>
+        <div class="food-edit-form open" id="add-food-form">
+          <div><label>名字</label><input type="text" id="new-food-name"></div>
+          <div><label>单位</label><input type="text" id="new-food-unit" placeholder="比如 1个 / 1份"></div>
+          <div><label>热量(kcal)</label><input type="number" step="any" id="new-food-kcal"></div>
+          <div><label>蛋白质(g)</label><input type="number" step="any" id="new-food-protein"></div>
+          <div><label>碳水(g)</label><input type="number" step="any" id="new-food-carb"></div>
+          <div><label>脂肪(g)</label><input type="number" step="any" id="new-food-fat"></div>
+          <button class="food-edit-save-btn" id="add-food-save-btn">添加</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
 let FOODS = [];
 let currentDays = 7;
 
 async function loadInitial() {
   const res = await fetch(`/api/data?days=${currentDays}`);
+  if (res.status === 401) { window.location.href = '/login'; return; }
   const data = await res.json();
   FOODS = data.foods;
   renderCharts(data);
@@ -374,7 +790,6 @@ function progressText(food) {
 function renderFoodList() {
   const container = document.getElementById('food-list');
   container.innerHTML = '';
-  const inputs = [];
 
   FOODS.forEach(food => {
     const row = document.createElement('div');
@@ -385,27 +800,36 @@ function renderFoodList() {
         <div class="food-name">${food.name}</div>
         <div class="food-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白</div>
       </div>
-      <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
-      <input type="number" step="any" class="food-input" data-id="${food.id}" value="" placeholder="0">
+      <div class="food-controls">
+        <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
+        <button class="plus-btn" data-id="${food.id}">+1份</button>
+        <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
+        <button class="add-btn" data-id="${food.id}">✓</button>
+      </div>
     `;
     container.appendChild(row);
+
     const input = row.querySelector('.food-input');
-    inputs.push(input);
+    const addBtn = row.querySelector('.add-btn');
+    const plusBtn = row.querySelector('.plus-btn');
+
+    addBtn.addEventListener('click', () => submitOne(food.id, input, row));
+    plusBtn.addEventListener('click', () => submitDirect(food.id, 1, row));
 
     input.addEventListener('keydown', e => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        submitOne(food.id, input, row, inputs);
+        submitOne(food.id, input, row);
         return;
       }
-      // 上下箭头：不改数值，改成在输入框之间跳，跟原生spin行为反过来
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
-        const idx = inputs.indexOf(input);
+        const allInputs = Array.from(document.querySelectorAll('.food-input'));
+        const idx = allInputs.indexOf(input);
         const nextIdx = e.key === 'ArrowUp' ? idx - 1 : idx + 1;
-        if (nextIdx >= 0 && nextIdx < inputs.length) {
-          inputs[nextIdx].focus();
-          inputs[nextIdx].select();
+        if (nextIdx >= 0 && nextIdx < allInputs.length) {
+          allInputs[nextIdx].focus();
+          allInputs[nextIdx].select();
         }
       }
     });
@@ -413,8 +837,6 @@ function renderFoodList() {
 }
 
 function refreshProgress(updatedFoods) {
-  // 只更新每行左边"今天吃了多少"的数字，不重建整个列表，
-  // 这样其他还没提交的输入框内容不会被打断。
   updatedFoods.forEach(food => {
     const el = document.getElementById(`progress-${food.id}`);
     if (!el) return;
@@ -423,30 +845,28 @@ function refreshProgress(updatedFoods) {
   FOODS = updatedFoods;
 }
 
-async function submitOne(foodId, input, row, inputs) {
+async function submitOne(foodId, input, row) {
   const v = parseFloat(input.value);
   if (isNaN(v) || v <= 0) return;
+  await submitDirect(foodId, v, row);
+  input.value = '';
+}
 
+async function submitDirect(foodId, servings, row) {
   try {
     const res = await fetch(`/api/record?days=${currentDays}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [foodId]: v })
+      body: JSON.stringify({ [foodId]: servings })
     });
+    if (res.status === 401) { window.location.href = '/login'; return; }
     const data = await res.json();
 
     renderCharts(data);
     refreshProgress(data.foods);
-    input.value = '';
 
     row.classList.add('flash');
     setTimeout(() => row.classList.remove('flash'), 900);
-
-    // 回车提交完，自动跳到下一个输入框，方便连续记录
-    const idx = inputs.indexOf(input);
-    if (idx >= 0 && idx + 1 < inputs.length) {
-      inputs[idx + 1].focus();
-    }
   } catch (err) {
     alert('记录失败，请检查服务是否还在运行。');
     console.error(err);
@@ -474,6 +894,7 @@ document.getElementById('clear-btn').addEventListener('click', async () => {
 
   try {
     const res = await fetch(`/api/clear-today?days=${currentDays}`, { method: 'POST' });
+    if (res.status === 401) { window.location.href = '/login'; return; }
     const data = await res.json();
     FOODS = data.foods;
     renderCharts(data);
@@ -484,7 +905,402 @@ document.getElementById('clear-btn').addEventListener('click', async () => {
   }
 });
 
+document.getElementById('undo-btn').addEventListener('click', async () => {
+  try {
+    const res = await fetch(`/api/undo?days=${currentDays}`, { method: 'POST' });
+    if (res.status === 401) { window.location.href = '/login'; return; }
+    const data = await res.json();
+    if (!data.undone) {
+      alert('今天还没有记录，没什么可撤回的。');
+      return;
+    }
+    FOODS = data.foods;
+    renderCharts(data);
+    renderFoodList();
+  } catch (err) {
+    alert('撤回失败，请检查服务是否还在运行。');
+    console.error(err);
+  }
+});
+
+const logoutBtn = document.getElementById('logout-btn');
+if (logoutBtn) {
+  logoutBtn.addEventListener('click', async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    window.location.href = '/login';
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 弹窗开关 + 地址栏hash联动
+//
+// 两个弹窗（编辑历史 #history / 管理食物 #foods）共用同一套开关逻辑。
+// 打开弹窗时把地址栏hash设成对应的名字，关闭时清空——这样：
+// 1. 浏览器的"后退"按钮能在"弹窗开着"和"弹窗关着"之间切换（History API的
+//    标准用法，不是我自己发明的技巧）
+// 2. 分享一个带#history的链接给别人，对方打开会自动弹出编辑历史面板
+// 3. 用地址栏的变化本身就在告诉你"现在在哪个视图"，不用靠肉眼分辨背景色
+// ---------------------------------------------------------------------------
+const MODALS = {
+  history: document.getElementById('history-modal'),
+  foods: document.getElementById('foods-modal'),
+};
+
+function openModal(name) {
+  Object.values(MODALS).forEach(m => m.classList.remove('open'));
+  MODALS[name].classList.add('open');
+  if (window.location.hash !== `#${name}`) {
+    window.history.pushState({ modal: name }, '', `#${name}`);
+  }
+  if (name === 'history') loadDayEntries(document.getElementById('edit-date').value);
+  if (name === 'foods') loadFoodEditList();
+}
+
+function closeModal() {
+  Object.values(MODALS).forEach(m => m.classList.remove('open'));
+  if (window.location.hash !== '') {
+    window.history.pushState({}, '', window.location.pathname);
+  }
+}
+
+function applyHash() {
+  const hash = window.location.hash.replace('#', '');
+  if (hash === 'history' || hash === 'foods') {
+    Object.values(MODALS).forEach(m => m.classList.remove('open'));
+    MODALS[hash].classList.add('open');
+    if (hash === 'history') loadDayEntries(document.getElementById('edit-date').value);
+    if (hash === 'foods') loadFoodEditList();
+  } else {
+    Object.values(MODALS).forEach(m => m.classList.remove('open'));
+  }
+}
+
+window.addEventListener('popstate', applyHash);
+
+document.getElementById('open-history-btn').addEventListener('click', () => openModal('history'));
+document.getElementById('close-history-btn').addEventListener('click', closeModal);
+document.getElementById('open-foods-btn').addEventListener('click', () => openModal('foods'));
+document.getElementById('close-foods-btn').addEventListener('click', closeModal);
+
+// 点弹窗外面的深色背景也能关闭，是弹窗类UI的标准行为
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) closeModal();
+  });
+});
+
+// Esc键关闭，同样是标准行为
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// ---- 编辑历史某一天的数据 ----
+const editDateInput = document.getElementById('edit-date');
+const todayStr = new Date().toISOString().slice(0, 10);
+editDateInput.value = todayStr;
+
+document.getElementById('load-day-btn').addEventListener('click', () => loadDayEntries(editDateInput.value));
+
+let pendingChanges = {};  // entryId -> {action: 'update', servings: X} 或 {action: 'delete'}
+
+async function loadDayEntries(dateStr) {
+  const container = document.getElementById('day-entries');
+  container.innerHTML = '<div class="empty-note">加载中…</div>';
+  pendingChanges = {};  // 每次重新加载这一天的数据，之前没确认的暂存改动作废
+
+  const res = await fetch(`/api/day?date=${dateStr}`);
+  if (res.status === 401) { window.location.href = '/login'; return; }
+  const data = await res.json();
+
+  if (!data.entries || data.entries.length === 0) {
+    container.innerHTML = '<div class="empty-note">这天没有记录。</div>';
+    updateConfirmBtnState();
+    return;
+  }
+
+  container.innerHTML = '';
+  data.entries.forEach(entry => {
+    const row = document.createElement('div');
+    row.className = 'entry-row';
+    row.id = `entry-row-${entry.id}`;
+    const canEdit = !!entry.food_id;
+    row.innerHTML = `
+      <div class="entry-info">
+        <div class="entry-name">${entry.food}</div>
+        <div class="entry-meta">${entry.time} · ${entry.kcal}kcal / ${entry.protein_g}g蛋白</div>
+      </div>
+      <div class="entry-controls">
+        ${canEdit ? `
+          <input type="number" step="any" class="entry-input" value="${entry.servings}">
+        ` : `<span class="entry-meta">（旧数据，不可编辑）</span>`}
+        <button class="entry-delete-btn">删除</button>
+      </div>
+    `;
+    container.appendChild(row);
+
+    if (canEdit) {
+      const editInput = row.querySelector('.entry-input');
+      editInput.addEventListener('input', () => {
+        const newVal = parseFloat(editInput.value);
+        if (isNaN(newVal) || newVal <= 0) {
+          delete pendingChanges[entry.id];
+          row.classList.remove('pending-edit');
+        } else if (newVal === parseFloat(entry.servings)) {
+          // 改回了原始值，等于没有改动，不需要占一个待确认的位置
+          delete pendingChanges[entry.id];
+          row.classList.remove('pending-edit');
+        } else {
+          pendingChanges[entry.id] = { action: 'update', servings: newVal };
+          row.classList.remove('pending-delete');
+          row.classList.add('pending-edit');
+        }
+        updateConfirmBtnState();
+      });
+    }
+
+    const deleteBtn = row.querySelector('.entry-delete-btn');
+    deleteBtn.addEventListener('click', () => {
+      const isMarked = row.classList.contains('pending-delete');
+      if (isMarked) {
+        // 再点一次取消标记删除
+        delete pendingChanges[entry.id];
+        row.classList.remove('pending-delete');
+        deleteBtn.textContent = '删除';
+      } else {
+        pendingChanges[entry.id] = { action: 'delete' };
+        row.classList.remove('pending-edit');
+        row.classList.add('pending-delete');
+        deleteBtn.textContent = '取消删除';
+      }
+      updateConfirmBtnState();
+    });
+  });
+
+  updateConfirmBtnState();
+}
+
+function updateConfirmBtnState() {
+  const btn = document.getElementById('confirm-history-btn');
+  const count = Object.keys(pendingChanges).length;
+  btn.disabled = count === 0;
+  btn.textContent = count === 0 ? '确认修改' : `确认修改（${count}处待保存）`;
+}
+
+document.getElementById('confirm-history-btn').addEventListener('click', async () => {
+  const entryIds = Object.keys(pendingChanges);
+  if (entryIds.length === 0) return;
+
+  for (const entryId of entryIds) {
+    const change = pendingChanges[entryId];
+    if (change.action === 'update') {
+      await fetch('/api/entry/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: entryId, servings: change.servings })
+      });
+    } else if (change.action === 'delete') {
+      await fetch('/api/entry/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: entryId })
+      });
+    }
+  }
+
+  pendingChanges = {};
+  await loadDayEntries(editDateInput.value);
+  await loadInitial();
+});
+
+
+// ---- 管理食物 ----
+async function loadFoodEditList() {
+  const container = document.getElementById('food-edit-list');
+  container.innerHTML = '<div class="empty-note">加载中…</div>';
+
+  const res = await fetch(`/api/data?days=1`);
+  if (res.status === 401) { window.location.href = '/login'; return; }
+  const data = await res.json();
+
+  container.innerHTML = '';
+  data.foods.forEach(food => {
+    const row = document.createElement('div');
+    row.className = 'food-edit-row';
+    row.innerHTML = `
+      <div class="food-edit-name-line">
+        <div>
+          <div class="food-edit-name">${food.name}</div>
+          <div class="food-edit-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白</div>
+        </div>
+        <div class="food-edit-toggle">编辑 ▾</div>
+      </div>
+      <div class="food-edit-form">
+        <div><label>名字</label><input type="text" class="f-name" value="${food.name}"></div>
+        <div><label>单位</label><input type="text" class="f-unit" value="${food.unit}"></div>
+        <div><label>热量(kcal)</label><input type="number" step="any" class="f-kcal" value="${food.kcal}"></div>
+        <div><label>蛋白质(g)</label><input type="number" step="any" class="f-protein" value="${food.protein}"></div>
+        <div><label>碳水(g)</label><input type="number" step="any" class="f-carb" value="${food.carb}"></div>
+        <div><label>脂肪(g)</label><input type="number" step="any" class="f-fat" value="${food.fat}"></div>
+        <button class="food-edit-save-btn">保存修改（会同步更新这个食物已有的历史记录）</button>
+        <button class="food-edit-delete-btn">删除这个食物</button>
+      </div>
+    `;
+    container.appendChild(row);
+
+    const nameLine = row.querySelector('.food-edit-name-line');
+    const form = row.querySelector('.food-edit-form');
+    const toggle = row.querySelector('.food-edit-toggle');
+    nameLine.addEventListener('click', () => {
+      form.classList.toggle('open');
+      toggle.textContent = form.classList.contains('open') ? '收起 ▴' : '编辑 ▾';
+    });
+
+    row.querySelector('.food-edit-save-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const payload = {
+        id: food.id,
+        name: row.querySelector('.f-name').value.trim(),
+        unit: row.querySelector('.f-unit').value.trim(),
+        kcal: parseFloat(row.querySelector('.f-kcal').value),
+        protein: parseFloat(row.querySelector('.f-protein').value),
+        carb: parseFloat(row.querySelector('.f-carb').value),
+        fat: parseFloat(row.querySelector('.f-fat').value),
+      };
+      if (!payload.name) { alert('名字不能为空'); return; }
+      const res = await fetch('/api/foods/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await res.json();
+      if (result.ok) {
+        if (result.updated_entries > 0) {
+          alert(`已保存，同步更新了 ${result.updated_entries} 条历史记录。`);
+        }
+        loadFoodEditList();
+        loadInitial();
+      } else {
+        alert('保存失败：' + (result.error || '未知错误'));
+      }
+    });
+
+    row.querySelector('.food-edit-delete-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const confirmed = confirm(
+        `确定删除"${food.name}"？\\n\\n` +
+        `已有的历史记录不会被删除或改动，会保留删除前最后的营养数值。\\n` +
+        `以后如果你新建一个同名食物，那会是一个完全独立的新食物，` +
+        `不会跟这次删除的记录产生任何关联。`
+      );
+      if (!confirmed) return;
+      const res = await fetch('/api/foods/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: food.id })
+      });
+      const result = await res.json();
+      if (result.ok) {
+        loadFoodEditList();
+        loadInitial();
+      } else {
+        alert('删除失败');
+      }
+    });
+  });
+}
+
+document.getElementById('add-food-save-btn').addEventListener('click', async () => {
+  const payload = {
+    name: document.getElementById('new-food-name').value.trim(),
+    unit: document.getElementById('new-food-unit').value.trim(),
+    kcal: parseFloat(document.getElementById('new-food-kcal').value) || 0,
+    protein: parseFloat(document.getElementById('new-food-protein').value) || 0,
+    carb: parseFloat(document.getElementById('new-food-carb').value) || 0,
+    fat: parseFloat(document.getElementById('new-food-fat').value) || 0,
+  };
+  if (!payload.name) { alert('名字不能为空'); return; }
+  if (!payload.unit) { alert('单位不能为空'); return; }
+
+  const res = await fetch('/api/foods/add', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const result = await res.json();
+  if (result.ok) {
+    ['name', 'unit', 'kcal', 'protein', 'carb', 'fat'].forEach(f => {
+      document.getElementById(`new-food-${f}`).value = '';
+    });
+    loadFoodEditList();
+    loadInitial();
+  } else {
+    alert('添加失败：' + (result.error || '未知错误'));
+  }
+});
+
 loadInitial();
+applyHash();  // 如果页面一打开地址栏就带着#history或#foods，直接呈现对应弹窗
+</script>
+</body>
+</html>
+"""
+
+
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录</title>
+<style>
+  :root {
+    --bg: #f6f4ee; --panel: #fffefb; --ink: #3c3b34; --ink-soft: #8b8776;
+    --sage: #5f8a72; --sage-dim: #7fa48f; --border: #e4e0d3; --danger: #b1543f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .box { width: 100%; max-width: 320px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 28px 24px; margin: 16px; }
+  h1 { font-size: 15px; margin: 0 0 20px; color: var(--ink); text-align: center; }
+  label { display: block; font-size: 12px; color: var(--ink-soft); margin-bottom: 4px; }
+  input { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--ink);
+    font-family: inherit; font-size: 15px; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
+  button { width: 100%; background: var(--sage); color: #fffefb; border: none; border-radius: 6px;
+    font-family: inherit; font-weight: 600; font-size: 14px; padding: 11px; cursor: pointer; }
+  button:hover { background: var(--sage-dim); }
+  .error { color: var(--danger); font-size: 12.5px; margin-bottom: 12px; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="box">
+    <h1>饮食记录</h1>
+    <div class="error" id="error"></div>
+    <form id="login-form">
+      <label>用户名</label>
+      <input type="text" id="username" autocomplete="username" required>
+      <label>密码</label>
+      <input type="password" id="password" autocomplete="current-password" required>
+      <button type="submit">登录</button>
+    </form>
+  </div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  });
+  if (res.ok) {
+    window.location.href = '/';
+  } else {
+    document.getElementById('error').textContent = '用户名或密码不对';
+  }
+});
 </script>
 </body>
 </html>
@@ -495,6 +1311,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # 不在终端刷屏打印每次请求日志
 
+    def _current_user(self):
+        if not AUTH_ENABLED:
+            return "local"
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        token = cookies.get("session")
+        if not token:
+            return None
+        return _get_session_user(token)
+
     def _send_json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -503,16 +1328,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, html, status=200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        if parsed.path == "/":
-            body = HTML_PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+        if parsed.path == "/login":
+            if not AUTH_ENABLED:
+                # 没配置账号密码，说明这个部署根本没启用登录验证，
+                # 这个页面在这种情况下永远登不进去（没有账号可以核对），
+                # 与其让人卡在一个注定失败的表单前，不如直接送回首页。
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            self._send_html(LOGIN_PAGE)
+            return
+
+        user = self._current_user()
+        if not user:
+            self.send_response(302)
+            self.send_header("Location", "/login")
             self.end_headers()
-            self.wfile.write(body)
+            return
+
+        if parsed.path == "/":
+            logout_html = '<button class="btn-small logout-btn" id="logout-btn">登出</button>' if AUTH_ENABLED else ''
+            self._send_html(HTML_PAGE.replace("__LOGOUT_BUTTON__", logout_html))
         elif parsed.path == "/api/data":
             qs = parse_qs(parsed.query)
             try:
@@ -521,11 +1369,51 @@ class Handler(BaseHTTPRequestHandler):
                 days = 7
             days = max(1, min(days, 365))  # 防止传入0、负数或离谱的大数字
             self._send_json(get_data_payload(days))
+        elif parsed.path == "/api/day":
+            qs = parse_qs(parsed.query)
+            date_str = qs.get("date", [""])[0]
+            entries = nt.get_entries_for_date(date_str)
+            self._send_json({"date": date_str, "entries": entries})
         else:
             self.send_error(404, "Not Found")
 
     def do_POST(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/api/login":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            username = data.get("username", "")
+            password = data.get("password", "")
+            if AUTH_USERS.get(username) == password and password != "":
+                token = _create_session(username)
+                self.send_response(200)
+                cookie_attrs = f"session={token}; Path=/; HttpOnly; Max-Age={SESSION_TTL_SECONDS}"
+                if SECURE_COOKIE:
+                    cookie_attrs += "; Secure"
+                self.send_header("Set-Cookie", cookie_attrs)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send_json({"error": "用户名或密码不对"}, status=401)
+            return
+
+        if parsed.path == "/api/logout":
+            self.send_response(200)
+            self.send_header("Set-Cookie", "session=; Path=/; HttpOnly; Max-Age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        user = self._current_user()
+        if not user:
+            self._send_json({"error": "未登录"}, status=401)
+            return
 
         if parsed.path == "/api/clear-today":
             qs = parse_qs(parsed.query)
@@ -538,6 +1426,125 @@ class Handler(BaseHTTPRequestHandler):
             nt.clear_today_entries()
             nt.write_summary_csv()
             self._send_json(get_data_payload(days))
+            return
+
+        if parsed.path == "/api/undo":
+            qs = parse_qs(parsed.query)
+            try:
+                days = int(qs.get("days", ["7"])[0])
+            except ValueError:
+                days = 7
+            days = max(1, min(days, 365))
+
+            removed = nt.undo_last_entry()
+            nt.write_summary_csv()
+            payload = get_data_payload(days)
+            payload["undone"] = removed["food"] if removed else None
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/entry/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            entry_id = data.get("id", "")
+            ok = nt.delete_entry_by_id(entry_id)
+            nt.write_summary_csv()
+            self._send_json({"ok": ok})
+            return
+
+        if parsed.path == "/api/entry/update":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            entry_id = data.get("id", "")
+            try:
+                new_servings = float(data.get("servings"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "份数格式不对"}, status=400)
+                return
+            if new_servings <= 0:
+                self._send_json({"error": "份数必须大于0"}, status=400)
+                return
+            ok = nt.update_entry_servings(entry_id, new_servings)
+            nt.write_summary_csv()
+            self._send_json({"ok": ok})
+            return
+
+        if parsed.path == "/api/foods/add":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            try:
+                new_id = nt.add_food(
+                    name=str(data.get("name", "")).strip(),
+                    unit=str(data.get("unit", "")).strip(),
+                    kcal=float(data.get("kcal", 0)),
+                    protein=float(data.get("protein", 0)),
+                    carb=float(data.get("carb", 0)),
+                    fat=float(data.get("fat", 0)),
+                )
+            except (TypeError, ValueError):
+                self._send_json({"error": "营养数值格式不对"}, status=400)
+                return
+            if not data.get("name", "").strip():
+                self._send_json({"error": "食物名字不能为空"}, status=400)
+                return
+            self._send_json({"ok": True, "id": new_id, "foods": get_foods_list()})
+            return
+
+        if parsed.path == "/api/foods/update":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            food_id = data.get("id", "")
+            if not str(data.get("name", "")).strip():
+                self._send_json({"error": "食物名字不能为空"}, status=400)
+                return
+            try:
+                ok, updated_count = nt.update_food(
+                    food_id,
+                    name=str(data.get("name", "")).strip(),
+                    unit=str(data.get("unit", "")).strip(),
+                    kcal=float(data.get("kcal", 0)),
+                    protein=float(data.get("protein", 0)),
+                    carb=float(data.get("carb", 0)),
+                    fat=float(data.get("fat", 0)),
+                )
+            except (TypeError, ValueError):
+                self._send_json({"error": "营养数值格式不对"}, status=400)
+                return
+            nt.write_summary_csv()  # 历史记录的营养值可能变了，导出用的汇总文件要跟着同步
+            self._send_json({"ok": ok, "updated_entries": updated_count, "foods": get_foods_list()})
+            return
+
+        if parsed.path == "/api/foods/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            food_id = data.get("id", "")
+            ok = nt.delete_food(food_id)
+            self._send_json({"ok": ok, "foods": get_foods_list()})
             return
 
         if parsed.path != "/api/record":
@@ -570,7 +1577,7 @@ class Handler(BaseHTTPRequestHandler):
             if servings <= 0:
                 continue
             item = nt.FOODS[food_id]
-            nt.append_entry(item, servings)
+            nt.append_entry(food_id, item, servings)
             recorded.append(f"{item['name']} x{servings}份")
 
         nt.write_summary_csv()
