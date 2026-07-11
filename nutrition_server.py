@@ -229,7 +229,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .top-bar {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     flex-wrap: wrap;
   }
   .btn-small {
@@ -238,9 +238,10 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--ink-soft);
     font-family: inherit;
     font-size: 11px;
-    padding: 6px 10px;
+    padding: 6px 8px;
     border-radius: 5px;
     cursor: pointer;
+    white-space: nowrap;
   }
   .btn-small:hover { background: var(--flash); }
   .clear-btn {
@@ -249,9 +250,10 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--danger);
     font-family: inherit;
     font-size: 11px;
-    padding: 6px 10px;
+    padding: 6px 8px;
     border-radius: 5px;
     cursor: pointer;
+    white-space: nowrap;
   }
   .clear-btn:hover { background: var(--danger-flash); }
   #undo-btn { margin-left: auto; }
@@ -720,7 +722,9 @@ HTML_PAGE = """<!DOCTYPE html>
     .food-input { font-size: 16px; width: 64px; padding: 10px 8px; }
     .add-btn { width: 42px; height: 42px; font-size: 18px; }
     .plus-btn { height: 42px; font-size: 13px; padding: 10px 12px; }
-    .range-btn, .btn-small, .clear-btn { font-size: 12.5px; padding: 8px 12px; }
+    .range-btn { font-size: 12.5px; padding: 8px 12px; }
+    .btn-small, .clear-btn { font-size: 11.5px; padding: 7px 9px; }
+    #undo-btn { padding-right: 10px; }
     .bar-label { width: 38px; font-size: 11px; }
     .bar-value { width: 40px; font-size: 11px; }
     .food-edit-form { grid-template-columns: 1fr; }
@@ -739,8 +743,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div class="top-bar">
       <button class="clear-btn" id="clear-btn">清空今天</button>
-      <button class="btn-small" id="open-history-btn">编辑历史</button>
-      <button class="btn-small" id="open-foods-btn">管理食物/目标</button>
+      <button class="btn-small" id="open-history-btn">历史</button>
+      <button class="btn-small" id="open-foods-btn">设置</button>
       __LOGOUT_BUTTON__
       <button class="btn-small" id="undo-btn">撤回上一步</button>
     </div>
