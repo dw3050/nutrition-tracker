@@ -51,7 +51,7 @@ _DEFAULT_FOODS = {
     "5": {"name": "冷冻蔬菜包", "unit": "1袋",  "kcal": 100, "protein": 3.3,  "carb": 18.3, "fat": 1.7},
     "6": {"name": "鸡胸肉",     "unit": "1磅",  "kcal": 517, "protein": 96.2, "carb": 0,    "fat": 11.8},
     "7": {"name": "香蕉",       "unit": "1根",  "kcal": 105, "protein": 1.3,  "carb": 27,   "fat": 0.4},
-    "8": {"name": "牛油果",     "unit": "1个",  "kcal": 322, "protein": 4,    "carb": 17,   "fat": 29.5},
+    "8": {"name": "牛油果",     "unit": "1个",  "kcal": 240, "protein": 3,    "carb": 13,   "fat": 22},
     "9": {"name": "额外热量",   "unit": "1卡",  "kcal": 1,   "protein": 0,    "carb": 0,    "fat": 0},
 }
 
