@@ -168,20 +168,20 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>饮食记录</title>
 <style>
   :root {
-    --bg: #f6f4ee;
-    --panel: #fffefb;
-    --ink: #3c3b34;
-    --ink-soft: #8b8776;
-    --sage: #5f8a72;
-    --sage-dim: #7fa48f;
-    --border: #e4e0d3;
-    --flash: #edf1e9;
-    --track: #eeece3;
-    --danger: #b1543f;
-    --danger-flash: #f5e8e4;
-    --modal-bg: #fbf3e6;
-    --modal-border: #e8d3a8;
-    --modal-accent: #b8863d;
+    --bg: #1a1d24;
+    --panel: #22262f;
+    --ink: #dcdde0;
+    --ink-soft: #838995;
+    --sage: #4a7c6f;
+    --sage-dim: #5f9186;
+    --border: #333944;
+    --flash: #2a2f3a;
+    --track: #2a2f3a;
+    --danger: #c1595f;
+    --danger-flash: #3a2428;
+    --modal-bg: #262019;
+    --modal-border: #4a3d29;
+    --modal-accent: #c9a15c;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -408,44 +408,100 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--ink-soft);
   }
 
+  /* 今天的进度条悬浮条——position:sticky不需要写JS去监听滚动事件，
+     浏览器原生支持"滚动到这个元素本来的位置之前正常排版，滚过去之后
+     自动贴在容器顶部"，这正好是"往下滑也能一直看到今天进度"这个需求
+     的标准实现方式。 */
+  .sticky-today-bar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 4px;
+    margin: 8px -6px 4px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+  }
+  .sticky-metric {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+  }
+  .sticky-metric-bar {
+    width: 46px;
+    height: 5px;
+    background: var(--track);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .sticky-metric-fill {
+    height: 100%;
+    background: var(--sage);
+  }
+  .sticky-metric-value {
+    color: var(--ink);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
   .food-row {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 8px 10px;
-    padding: 10px 6px;
+    gap: 8px;
+    padding: 9px 6px;
     border-radius: 4px;
     border-bottom: 1px solid var(--border);
     transition: background 0.5s ease;
   }
   .food-row:last-child { border-bottom: none; }
   .food-row.flash { background: var(--flash); }
-  .food-info { flex: 1 1 100%; min-width: 0; }
-  .food-name { color: var(--ink); font-size: 14px; }
-  .food-meta { color: var(--ink-soft); font-size: 11.5px; margin-top: 1px; }
+  .food-info {
+    flex: 1 1 auto;
+    min-width: 0;   /* 允许内部文字被压缩到能显示省略号，而不是把整行撑爆换行 */
+    overflow: hidden;
+  }
+  .food-name {
+    color: var(--ink);
+    font-size: 13.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;   /* 名字太长时省略号截断，不会把按钮挤到下一行 */
+  }
+  .food-meta {
+    color: var(--ink-soft);
+    font-size: 11px;
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .food-controls {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     margin-left: auto;
+    flex-shrink: 0;   /* 控件区域永远保持完整大小，收缩空间的责任全部交给左边的文字省略号 */
   }
   .food-progress {
-    min-width: 26px;
+    min-width: 20px;
     text-align: right;
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 600;
     color: var(--sage);
-    margin-right: 4px;
+    margin-right: 2px;
   }
   .food-input {
-    width: 58px;
+    width: 44px;
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--ink);
     font-family: inherit;
-    font-size: 15px;
-    padding: 8px 8px;
+    font-size: 14px;
+    padding: 7px 6px;
     border-radius: 5px;
     text-align: right;
     -moz-appearance: textfield;
@@ -459,7 +515,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .food-input:focus {
     outline: none;
     border-color: var(--sage-dim);
-    box-shadow: 0 0 0 2px rgba(95,138,114,0.15);
+    box-shadow: 0 0 0 2px rgba(74,124,111,0.25);
   }
   .add-btn, .plus-btn {
     background: var(--sage);
@@ -473,14 +529,14 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .add-btn:hover, .plus-btn:hover { background: var(--sage-dim); }
   .add-btn {
-    font-size: 16px;
-    width: 38px;
-    height: 38px;
+    font-size: 14px;
+    width: 32px;
+    height: 32px;
   }
   .plus-btn {
-    font-size: 12px;
-    padding: 8px 10px;
-    height: 38px;
+    font-size: 11px;
+    padding: 7px 8px;
+    height: 32px;
     white-space: nowrap;
   }
 
@@ -490,7 +546,7 @@ HTML_PAGE = """<!DOCTYPE html>
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(60, 55, 40, 0.35);
+    background: rgba(0, 0, 0, 0.55);
     align-items: flex-start;
     justify-content: center;
     padding: 24px 12px;
@@ -530,7 +586,7 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor: pointer;
     line-height: 1;
   }
-  .modal-close-btn:hover { background: rgba(184,134,61,0.12); }
+  .modal-close-btn:hover { background: rgba(201,161,92,0.15); }
 
   .day-editor-controls {
     display: flex;
@@ -540,7 +596,7 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-bottom: 10px;
   }
   .date-input {
-    background: #fffefb;
+    background: var(--bg);
     border: 1px solid var(--modal-border);
     color: var(--ink);
     font-family: inherit;
@@ -567,7 +623,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .entry-input {
     width: 56px;
-    background: #fffefb;
+    background: var(--bg);
     border: 1px solid var(--modal-border);
     color: var(--ink);
     font-family: inherit;
@@ -665,7 +721,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .food-edit-form input {
     width: 100%;
-    background: #fffefb;
+    background: var(--bg);
     border: 1px solid var(--modal-border);
     color: var(--ink);
     font-family: inherit;
@@ -717,11 +773,11 @@ HTML_PAGE = """<!DOCTYPE html>
   @media (max-width: 480px) {
     body { padding: 10px 8px; }
     .panel, .modal-box { padding: 14px 12px; border-radius: 6px; }
-    .food-name { font-size: 15px; }
-    .food-meta { font-size: 12px; }
-    .food-input { font-size: 16px; width: 64px; padding: 10px 8px; }
-    .add-btn { width: 42px; height: 42px; font-size: 18px; }
-    .plus-btn { height: 42px; font-size: 13px; padding: 10px 12px; }
+    .food-name { font-size: 14.5px; }
+    .food-meta { font-size: 11.5px; }
+    .food-input { font-size: 16px; width: 42px; padding: 7px 5px; }
+    .add-btn { width: 30px; height: 30px; font-size: 14px; }
+    .plus-btn { height: 30px; font-size: 11px; padding: 6px 8px; }
     .range-btn { font-size: 12.5px; padding: 8px 12px; }
     .btn-small, .clear-btn { font-size: 11.5px; padding: 7px 9px; }
     #undo-btn { padding-right: 10px; }
@@ -766,6 +822,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="section-label" id="range-title">过去 7 天</div>
     <div id="chart-container"></div>
 
+    <div class="sticky-today-bar" id="sticky-today-bar"></div>
     <div class="section-label">记录</div>
     <div id="food-list"></div>
 
@@ -865,10 +922,10 @@ async function loadInitial() {
 }
 
 const METRIC_CONFIG = {
-  kcal:    { title: '🔥 总热量 (kcal)',   key: 'kcal',    fill: '█', showVeg: true,  target: payload => payload.target_kcal },
-  protein: { title: '💪 总蛋白质 (g)',    key: 'protein', fill: '▓', showVeg: false, target: payload => payload.target_protein },
-  carb:    { title: '🍞 总碳水 (g)',      key: 'carb',    fill: '▒', showVeg: false, target: payload => payload.target_carb },
-  fat:     { title: '🥑 总脂肪 (g)',      key: 'fat',     fill: '░', showVeg: false, target: payload => payload.target_fat },
+  kcal:    { title: '🔥 总热量 (kcal)',   icon: '🔥', key: 'kcal',    fill: '█', showVeg: true,  target: payload => payload.target_kcal },
+  protein: { title: '💪 总蛋白质 (g)',    icon: '💪', key: 'protein', fill: '▓', showVeg: false, target: payload => payload.target_protein },
+  carb:    { title: '🍞 总碳水 (g)',      icon: '🍞', key: 'carb',    fill: '▒', showVeg: false, target: payload => payload.target_carb },
+  fat:     { title: '🥑 总脂肪 (g)',      icon: '🥑', key: 'fat',     fill: '░', showVeg: false, target: payload => payload.target_fat },
 };
 
 function renderCharts(data) {
@@ -884,6 +941,31 @@ function renderCharts(data) {
     div.innerHTML = buildChart(config.title, data.week, config.key, target, config.showVeg, config.fill);
     container.appendChild(div);
   });
+  renderStickyBar(data);
+}
+
+function renderStickyBar(data) {
+  const today = data.week.find(d => d.is_today);
+  const container = document.getElementById('sticky-today-bar');
+  if (!today) { container.innerHTML = ''; return; }
+
+  // 跟主图表一样，只显示用户当前选中的那几个指标——保持两处呈现的信息一致，
+  // 不会出现"主图表没显示碳水，悬浮条却显示了"这种不一致的情况。
+  container.innerHTML = Array.from(selectedMetrics).map(metric => {
+    const config = METRIC_CONFIG[metric];
+    if (!config) return '';
+    const val = today[config.key];
+    const target = config.target(data);
+    const pct = target > 0 ? Math.min((val / target) * 100, 100) : 0;
+    const valueText = target > 0 ? `${val.toFixed(0)}/${target.toFixed(0)}` : val.toFixed(0);
+    return `
+      <div class="sticky-metric">
+        <span>${config.icon}</span>
+        <div class="sticky-metric-bar"><div class="sticky-metric-fill" style="width:${pct}%"></div></div>
+        <span class="sticky-metric-value">${valueText}</span>
+      </div>
+    `;
+  }).join('');
 }
 
 function buildChart(title, week, key, target, showVeg, fillChar) {
@@ -905,7 +987,7 @@ function buildChart(title, week, key, target, showVeg, fillChar) {
           ${hasTarget ? `<div class="bar-target-line" style="left:${targetPct}%"></div>` : ''}
         </div>
         <div class="bar-value">${val.toFixed(1)}</div>
-        ${showVeg ? `<div class="bar-veg">${vegMark}</div>` : ''}
+        <div class="bar-veg">${vegMark}</div>
       </div>
     `;
   }).join('');
@@ -939,7 +1021,7 @@ function renderFoodList() {
         <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
         <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
         <button class="add-btn" data-id="${food.id}">✓</button>
-        <button class="plus-btn" data-id="${food.id}">+1份</button>
+        <button class="plus-btn" data-id="${food.id}">+1</button>
       </div>
     `;
     container.appendChild(row);
@@ -1520,8 +1602,8 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <title>登录</title>
 <style>
   :root {
-    --bg: #f6f4ee; --panel: #fffefb; --ink: #3c3b34; --ink-soft: #8b8776;
-    --sage: #5f8a72; --sage-dim: #7fa48f; --border: #e4e0d3; --danger: #b1543f;
+    --bg: #1a1d24; --panel: #22262f; --ink: #dcdde0; --ink-soft: #838995;
+    --sage: #4a7c6f; --sage-dim: #5f9186; --border: #333944; --danger: #c1595f;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
