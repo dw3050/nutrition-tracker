@@ -48,11 +48,12 @@ _DEFAULT_FOODS = {
     "2": {"name": "无糖燕麦粥", "unit": "1份",  "kcal": 130, "protein": 5.5,  "carb": 21.8, "fat": 2.3},
     "3": {"name": "水煮虾",     "unit": "10只", "kcal": 91,  "protein": 17,   "carb": 0,    "fat": 0.8},
     "4": {"name": "蛋白粉",     "unit": "1勺",  "kcal": 120, "protein": 24,   "carb": 3,    "fat": 1},
-    "5": {"name": "冷冻蔬菜包", "unit": "1袋",  "kcal": 100, "protein": 3.3,  "carb": 18.3, "fat": 1.7},
+    "5": {"name": "冷冻蔬菜包", "unit": "1袋",  "kcal": 100, "protein": 3.3,  "carb": 18.3, "fat": 1.7, "tracker": "vegetable"},
     "6": {"name": "鸡胸肉",     "unit": "1磅",  "kcal": 517, "protein": 96.2, "carb": 0,    "fat": 11.8},
     "7": {"name": "香蕉",       "unit": "1根",  "kcal": 105, "protein": 1.3,  "carb": 27,   "fat": 0.4},
     "8": {"name": "牛油果",     "unit": "1个",  "kcal": 240, "protein": 3,    "carb": 13,   "fat": 22},
     "9": {"name": "额外热量",   "unit": "1卡",  "kcal": 1,   "protein": 0,    "carb": 0,    "fat": 0},
+    "10": {"name": "维生素补剂", "unit": "1份",  "kcal": 0,   "protein": 0,    "carb": 0,    "fat": 0, "tracker": "vitamin"},
 }
 
 
@@ -97,22 +98,37 @@ def _save_foods():
     _save_foods_file(FOODS, _NEXT_FOOD_ID)
 
 
-def add_food(name, unit, kcal, protein, carb, fat):
+def _clear_other_holders_of_tracker(tracker_type, except_id=None):
+    """
+    确保同一个tracker类型(vegetable/vitamin)同时只有一个食物持有——
+    如果不这么做，用户可能不小心把两种食物都标成"蔬菜"，那"今天吃了蔬菜没"
+    这种判断就会变得含糊不清（该按哪个食物的记录算？）。
+    新设置一个持有者之前，先把其他食物身上同类型的旧标记摘掉。
+    """
+    if not tracker_type:
+        return
+    for fid, item in FOODS.items():
+        if fid != except_id and item.get("tracker") == tracker_type:
+            item.pop("tracker", None)
+
+
+def add_food(name, unit, kcal, protein, carb, fat, tracker=None):
     """新增一种食物，用只增不减的计数器分配id，绝不会跟历史上曾经存在过、哪怕已被删除的食物撞号。"""
     global _NEXT_FOOD_ID
     new_id = str(_NEXT_FOOD_ID)
-    FOODS[new_id] = {
-        "name": name, "unit": unit,
-        "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
-    }
+    _clear_other_holders_of_tracker(tracker, except_id=new_id)
+    entry = {"name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat}
+    if tracker:
+        entry["tracker"] = tracker
+    FOODS[new_id] = entry
     _NEXT_FOOD_ID += 1
     _save_foods()
     return new_id
 
 
-def update_food(food_id, name, unit, kcal, protein, carb, fat):
+def update_food(food_id, name, unit, kcal, protein, carb, fat, tracker=None):
     """
-    修改某个食物的定义（名字/单位/营养值），并把这个改动同步应用到
+    修改某个食物的定义（名字/单位/营养值/特殊标记），并把这个改动同步应用到
     这个食物已有的所有历史记录上——按你的要求，"编辑"代表的是同一个食物
     的定义在演进，不是变成了另一个东西，所以历史记录应该跟着新定义重算，
     而不是继续保留编辑前的旧快照。
@@ -125,10 +141,11 @@ def update_food(food_id, name, unit, kcal, protein, carb, fat):
     """
     if food_id not in FOODS:
         return False, 0
-    FOODS[food_id] = {
-        "name": name, "unit": unit,
-        "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
-    }
+    _clear_other_holders_of_tracker(tracker, except_id=food_id)
+    entry = {"name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat}
+    if tracker:
+        entry["tracker"] = tracker
+    FOODS[food_id] = entry
     _save_foods()
     updated_count = recompute_entries_for_food(food_id)
     return True, updated_count
@@ -148,13 +165,29 @@ def delete_food(food_id):
     return True
 
 
+def get_special_food_name(tracker_type):
+    """
+    查找带有特殊标记(tracker)的食物，返回它当前的名字。
+    tracker_type 是 "vegetable" 或 "vitamin"。
+    用标记字段而不是硬编码某个id，是因为"哪个食物承担这个特殊追踪角色"这件事
+    应该由用户自己在"管理食物"里指定，不该是我写死在代码里的假设。
+
+    向后兼容：老版本的数据里食物没有tracker这个字段(这个字段是后来才加的)，
+    如果找不到任何食物带vegetable标记，退回到"id=5就是蔬菜"这个历史假设，
+    不然老用户升级后蔬菜打卡功能会突然失效。vitamin没有这个历史包袱，
+    找不到就是没有，不用编造一个默认值。
+    """
+    for food_id, item in FOODS.items():
+        if item.get("tracker") == tracker_type:
+            return item["name"]
+    if tracker_type == "vegetable":
+        return FOODS.get("5", {}).get("name", "")
+    return ""
+
+
 def get_vegetable_food_name():
-    """
-    动态读取"蔬菜"这个食物当前的名字，不能用一个写死的常量缓存，
-    因为现在食物名字可以通过网页随时被改，缓存下来的名字会过时，
-    导致"今天吃了蔬菜没"这个判断悄悄失效。
-    """
-    return FOODS.get("5", {}).get("name", "")
+    """向后兼容旧代码里的调用方式，内部转发给通用版本。"""
+    return get_special_food_name("vegetable")
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +408,31 @@ def ensure_csv_exists():
     print("=" * 70)
 
 
-def append_entry(food_id, food_item, servings):
+def _resolve_today(today_override=None):
+    """
+    统一处理"今天是哪天"这个问题。
+    优先使用调用方传入的日期字符串(浏览器用JS算出的、用户自己所在时区的本地日期)，
+    没传的时候才退回服务器自己的系统时间——这个退回路径主要是给终端版CLI用的，
+    终端版直接跑在你自己电脑上，系统时间本来就是你的本地时间，没有这个时区错位问题。
+    网页版任何涉及"今天"判断的请求，都应该带上这个参数，不能让服务器自己猜。
+    """
+    if today_override:
+        try:
+            return datetime.strptime(today_override, "%Y-%m-%d").date()
+        except ValueError:
+            pass  # 格式不对就当没传，退回服务器时间，不让一个格式错误直接搞崩整个请求
+    return datetime.now().date()
+
+
+def append_entry(food_id, food_item, servings, client_datetime=None):
     ensure_csv_exists()  # 每次写入前都检查一遍，不能只信任"启动时已经检查过"——
     # 如果文件在程序运行期间被外部删除（比如你去Shell里手动删了），
     # 下次追加写入会创建一个没有表头的文件，后面所有读取都会被污染。
-    now = datetime.now()
+    #
+    # 记录用的日期/时间优先用client_datetime(浏览器传来的、用户本地时区的当前时刻)，
+    # 不用服务器自己的datetime.now()——服务器在Render上跑的是UTC，直接用会导致
+    # 晚上记录的东西被打上"明天"的日期标签，跟你本地实际感受的日期对不上。
+    now = client_datetime if client_datetime else datetime.now()
     entry_id = uuid.uuid4().hex[:10]
     with open(CSV_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -398,14 +451,14 @@ def append_entry(food_id, food_item, servings):
     return entry_id
 
 
-def clear_today_entries():
+def clear_today_entries(today_override=None):
     """
     删除明细表(CSV_PATH)里"今天"的所有行，历史数据不受影响。
     用于误输入后的一键重来，不是撤销单条记录——是把今天清零重新开始。
     做法是把不是今天的行原样保留、重写整个文件，而不是"追加一条反向抵消记录"，
     这样CSV里不会留下垃圾数据，今天这一天在文件里就跟没记录过一样干净。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _resolve_today(today_override).strftime("%Y-%m-%d")
 
     if not os.path.exists(CSV_PATH):
         return
@@ -424,7 +477,7 @@ def clear_today_entries():
             writer.writerow(row)
 
 
-def undo_last_entry():
+def undo_last_entry(today_override=None):
     """
     撤销"今天"最后添加的一条记录。
     做法：读出今天的所有行，按文件里的顺序（也就是记录的时间顺序，因为
@@ -432,7 +485,7 @@ def undo_last_entry():
     返回被删除的那条记录（方便调用方告诉用户"撤销了什么"），
     如果今天没有任何记录，返回None。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _resolve_today(today_override).strftime("%Y-%m-%d")
 
     if not os.path.exists(CSV_PATH):
         return None
@@ -590,8 +643,8 @@ def update_entry_servings(entry_id, new_servings):
     return True
 
 
-def get_today_total():
-    today = datetime.now().strftime("%Y-%m-%d")
+def get_today_total(today_override=None):
+    today = _resolve_today(today_override).strftime("%Y-%m-%d")
     total = {"kcal": 0.0, "protein": 0.0, "carb": 0.0, "fat": 0.0}
     records = []
     if not os.path.exists(CSV_PATH):
@@ -656,7 +709,7 @@ def compute_all_daily_totals():
     return totals_by_date
 
 
-def get_last_n_days_data(n=7):
+def get_last_n_days_data(n=7, today_override=None):
     """
     返回过去n天（含今天）的日期列表(旧→新)，以及对应的 {kcal, protein, carb, fat} 数据。
     直接调用 compute_all_daily_totals() 现算，不再读 SUMMARY_CSV_PATH。
@@ -664,7 +717,7 @@ def get_last_n_days_data(n=7):
     汇总CSV文件的状态完全不影响程序自己的计算结果——它只是个单向导出的报告，
     不再是程序信任的数据来源。
     """
-    today = datetime.now().date()
+    today = _resolve_today(today_override)
     dates = [today - timedelta(days=i) for i in range(n - 1, -1, -1)]  # n-1天前 -> 今天
     all_totals = compute_all_daily_totals()
 
@@ -682,13 +735,13 @@ def get_last_n_days_data(n=7):
     return dates, data
 
 
-def get_today_servings_by_food():
+def get_today_servings_by_food(today_override=None):
     """
     返回今天每种食物已经吃了多少份，格式 {food_id: 份数}。
     按食物名称匹配明细表当天的记录并累加servings，同一食物今天记录了多次
     （比如早上吃1个鸡蛋、晚上又吃1个）会自动加总，不是只取最后一次。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _resolve_today(today_override).strftime("%Y-%m-%d")
     name_to_id = {item["name"]: food_id for food_id, item in FOODS.items()}
     eaten = {food_id: 0.0 for food_id in FOODS}
 
@@ -712,22 +765,29 @@ def get_today_servings_by_food():
     return eaten
 
 
-def get_vegetable_days():
+def get_tracked_days(tracker_type):
     """
-    返回过去7天中，哪些日期吃过蔬菜（一个 set，元素是 'YYYY-MM-DD' 字符串）。
-    这里必须读明细表(CSV_PATH)而不是每日汇总表——因为汇总表只存热量/蛋白/碳水
-    三个数字，不记录"吃了什么"，要判断"今天有没有吃蔬菜"这种是非型问题，
-    只能回到明细记录里按食物名称匹配。
+    返回过去所有日期中，哪些天记录过带指定特殊标记(vegetable/vitamin)的食物。
+    这是get_vegetable_days的泛化版本——蔬菜打卡和维生素打卡用的是同一套逻辑，
+    只是查的标记类型不同，没必要为每种特殊追踪都单独写一个函数。
     """
-    veg_days = set()
+    tracked_days = set()
+    food_name = get_special_food_name(tracker_type)
+    if not food_name:
+        return tracked_days
     if not os.path.exists(CSV_PATH):
-        return veg_days
+        return tracked_days
     with open(CSV_PATH, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("food") == get_vegetable_food_name():
-                veg_days.add(row["date"])
-    return veg_days
+            if row.get("food") == food_name:
+                tracked_days.add(row["date"])
+    return tracked_days
+
+
+def get_vegetable_days():
+    """向后兼容旧代码里的调用方式，内部转发给通用版本。"""
+    return get_tracked_days("vegetable")
 
 
 def _render_bar_row(label, val, target, max_scale, width, fill_char):

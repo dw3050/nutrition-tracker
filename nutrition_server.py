@@ -96,16 +96,36 @@ def _parse_cookies(header_value):
     return cookies
 
 
-def get_week_payload(days=7):
+def _parse_client_datetime(raw):
+    """
+    解析前端传来的本地时间字符串(格式 "YYYY-MM-DDTHH:MM:SS")，
+    返回 (日期字符串, datetime对象)，解析失败或没传就都返回None，
+    调用方各自决定要不要退回到服务器自己的时间。
+    """
+    if not raw:
+        return None, None
+    try:
+        dt = nt.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%S")
+        return dt.strftime("%Y-%m-%d"), dt
+    except ValueError:
+        return None, None
+
+
+def get_week_payload(days=7, client_today=None):
     """
     返回过去n天的结构化数据（不是渲染好的文本），
     交给前端用CSS画柱状图，不依赖等宽字体里中文=2倍宽度这个在浏览器里不成立的假设。
     终端版(nutrition_tracker.py里的print_weekly_bar_chart)不受影响，继续用文本渲染，
     因为终端环境这个假设是成立的。
+
+    client_today: 浏览器传来的、用户本地时区的今天日期字符串(YYYY-MM-DD)。
+    Render服务器跑在UTC，不能用服务器自己的系统时间判断"今天是哪天"——
+    那样一到晚上(美东时间)服务器那边已经跨天了，会把"今天"错判成明天。
     """
-    dates, data = nt.get_last_n_days_data(days)
-    veg_days = nt.get_vegetable_days()
-    today_str = nt.datetime.now().date().strftime("%Y-%m-%d")
+    dates, data = nt.get_last_n_days_data(days, today_override=client_today)
+    veg_days = nt.get_tracked_days("vegetable")
+    vit_days = nt.get_tracked_days("vitamin")
+    today_str = nt._resolve_today(client_today).strftime("%Y-%m-%d")
 
     week = []
     for d in dates:
@@ -119,6 +139,7 @@ def get_week_payload(days=7):
             "carb": data[key]["carb"],
             "fat": data[key]["fat"],
             "veg": key in veg_days,
+            "vitamin": key in vit_days,
         })
     return week
 
@@ -130,8 +151,8 @@ def _get_users_list():
     ]
 
 
-def get_foods_list():
-    eaten_today = nt.get_today_servings_by_food()
+def get_foods_list(client_today=None):
+    eaten_today = nt.get_today_servings_by_food(today_override=client_today)
     return [
         {
             "id": food_id,
@@ -141,18 +162,19 @@ def get_foods_list():
             "protein": item["protein"],
             "carb": item["carb"],
             "fat": item["fat"],
+            "tracker": item.get("tracker"),
             "eaten_today": eaten_today.get(food_id, 0.0),
         }
         for food_id, item in nt.FOODS.items()
     ]
 
 
-def get_data_payload(days=7):
+def get_data_payload(days=7, client_today=None):
     nt.write_summary_csv()  # 顺手把导出用的汇总文件也同步一次，不影响图表本身的计算
     target_kcal, target_protein, target_carb, target_fat = nt.get_targets()
     return {
-        "week": get_week_payload(days),
-        "foods": get_foods_list(),
+        "week": get_week_payload(days, client_today),
+        "foods": get_foods_list(client_today),
         "target_kcal": target_kcal,
         "target_protein": target_protein,
         "target_carb": target_carb,
@@ -327,11 +349,12 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--ink);
   }
   .bar-veg {
-    width: 14px;
+    width: 32px;
     flex-shrink: 0;
-    text-align: center;
+    text-align: right;
     color: var(--sage);
     font-size: 12px;
+    white-space: nowrap;
   }
 
   .range-picker {
@@ -418,8 +441,8 @@ HTML_PAGE = """<!DOCTYPE html>
     z-index: 40;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
-    padding: 8px 4px;
-    margin: 8px -6px 4px;
+    padding: 8px 6px;
+    margin: 8px 0 4px;
     display: flex;
     flex-wrap: wrap;
     gap: 6px 16px;
@@ -719,7 +742,8 @@ HTML_PAGE = """<!DOCTYPE html>
     display: block;
     margin-bottom: 2px;
   }
-  .food-edit-form input {
+  .food-edit-form input,
+  .food-edit-form select {
     width: 100%;
     background: var(--bg);
     border: 1px solid var(--modal-border);
@@ -875,6 +899,14 @@ HTML_PAGE = """<!DOCTYPE html>
           <div><label>蛋白质(g)</label><input type="number" step="any" id="new-food-protein"></div>
           <div><label>碳水(g)</label><input type="number" step="any" id="new-food-carb"></div>
           <div><label>脂肪(g)</label><input type="number" step="any" id="new-food-fat"></div>
+          <div class="full-width">
+            <label>特殊标记(选填)</label>
+            <select id="new-food-tracker">
+              <option value="">无</option>
+              <option value="vegetable">蔬菜打卡</option>
+              <option value="vitamin">维生素打卡</option>
+            </select>
+          </div>
           <button class="food-edit-save-btn" id="add-food-save-btn">添加</button>
         </div>
       </div>
@@ -902,8 +934,20 @@ let currentDays = 7;
 let selectedMetrics = new Set(JSON.parse(localStorage.getItem('nutritionMetrics') || '["kcal","protein"]'));
 let CURRENT_IS_ADMIN = false;
 
+// 计算浏览器所在时区的本地当前时间，格式"YYYY-MM-DDTHH:MM:SS"。
+// 必须用这个而不是服务器自己的时间——Render服务器跑在UTC，"今天是哪天"这种
+// 判断如果交给服务器自己算，一到晚上(比如美东时间)就会因为UTC已经跨天而判断错误。
+// 用的是Date对象的本地getter(getFullYear/getMonth/getDate等)，不是toISOString()——
+// toISOString()返回的是UTC时间，会犯同样的错误，这里必须用本地时间的取值方法。
+function getClientDatetimeParam() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const s = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return s;
+}
+
 async function loadInitial() {
-  const res = await fetch(`/api/data?days=${currentDays}`);
+  const res = await fetch(`/api/data?days=${currentDays}&client_datetime=${encodeURIComponent(getClientDatetimeParam())}`);
   if (res.status === 401) { window.location.href = '/login'; return; }
   const data = await res.json();
   FOODS = data.foods;
@@ -977,7 +1021,11 @@ function buildChart(title, week, key, target, showVeg, fillChar) {
     const targetPct = hasTarget ? (target / maxVal) * 100 : null;
     const labelClass = d.is_today ? 'bar-label today' : 'bar-label';
     const todayTag = d.is_today ? '今天' : '';
-    const vegMark = showVeg && d.veg ? '✓' : '';
+    // 蔬菜和维生素这两个emoji放在同一列里，不管有没有勾中都统一渲染这一列，
+    // 保证这一列的宽度在四张图表(热量/蛋白/碳水/脂肪)里完全一致——
+    // 之前的bug教训是：只有部分图表渲染这一列会导致进度条宽度不对齐。
+    const vegMark = showVeg && d.veg ? '🥦' : '';
+    const vitaminMark = showVeg && d.vitamin ? '💊' : '';
     return `
       <div class="bar-row">
         <div class="${labelClass}">${d.label}</div>
@@ -987,7 +1035,7 @@ function buildChart(title, week, key, target, showVeg, fillChar) {
           ${hasTarget ? `<div class="bar-target-line" style="left:${targetPct}%"></div>` : ''}
         </div>
         <div class="bar-value">${val.toFixed(1)}</div>
-        <div class="bar-veg">${vegMark}</div>
+        <div class="bar-veg">${vegMark}${vitaminMark}</div>
       </div>
     `;
   }).join('');
@@ -1071,7 +1119,7 @@ async function submitOne(foodId, input, row) {
 
 async function submitDirect(foodId, servings, row) {
   try {
-    const res = await fetch(`/api/record?days=${currentDays}`, {
+    const res = await fetch(`/api/record?days=${currentDays}&client_datetime=${encodeURIComponent(getClientDatetimeParam())}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ [foodId]: servings })
@@ -1126,7 +1174,7 @@ document.getElementById('clear-btn').addEventListener('click', async () => {
   if (!confirm('清空今天记录的所有食物？这个操作不能撤销。')) return;
 
   try {
-    const res = await fetch(`/api/clear-today?days=${currentDays}`, { method: 'POST' });
+    const res = await fetch(`/api/clear-today?days=${currentDays}&client_datetime=${encodeURIComponent(getClientDatetimeParam())}`, { method: 'POST' });
     if (res.status === 401) { window.location.href = '/login'; return; }
     const data = await res.json();
     FOODS = data.foods;
@@ -1140,7 +1188,7 @@ document.getElementById('clear-btn').addEventListener('click', async () => {
 
 document.getElementById('undo-btn').addEventListener('click', async () => {
   try {
-    const res = await fetch(`/api/undo?days=${currentDays}`, { method: 'POST' });
+    const res = await fetch(`/api/undo?days=${currentDays}&client_datetime=${encodeURIComponent(getClientDatetimeParam())}`, { method: 'POST' });
     if (res.status === 401) { window.location.href = '/login'; return; }
     const data = await res.json();
     if (!data.undone) {
@@ -1351,7 +1399,7 @@ async function loadFoodEditList() {
   const container = document.getElementById('food-edit-list');
   container.innerHTML = '<div class="empty-note">加载中…</div>';
 
-  const res = await fetch(`/api/data?days=1`);
+  const res = await fetch(`/api/data?days=1&client_datetime=${encodeURIComponent(getClientDatetimeParam())}`);
   if (res.status === 401) { window.location.href = '/login'; return; }
   const data = await res.json();
 
@@ -1359,11 +1407,13 @@ async function loadFoodEditList() {
   data.foods.forEach(food => {
     const row = document.createElement('div');
     row.className = 'food-edit-row';
+    const trackerLabel = food.tracker === 'vegetable' ? ' · 🥦蔬菜打卡'
+                        : food.tracker === 'vitamin' ? ' · 💊维生素打卡' : '';
     row.innerHTML = `
       <div class="food-edit-name-line">
         <div>
           <div class="food-edit-name">${food.name}</div>
-          <div class="food-edit-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白</div>
+          <div class="food-edit-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白${trackerLabel}</div>
         </div>
         <div class="food-edit-toggle">编辑 ▾</div>
       </div>
@@ -1374,6 +1424,14 @@ async function loadFoodEditList() {
         <div><label>蛋白质(g)</label><input type="number" step="any" class="f-protein" value="${food.protein}"></div>
         <div><label>碳水(g)</label><input type="number" step="any" class="f-carb" value="${food.carb}"></div>
         <div><label>脂肪(g)</label><input type="number" step="any" class="f-fat" value="${food.fat}"></div>
+        <div class="full-width">
+          <label>特殊标记(选填，同类型只能有一个食物持有，设置后会自动取消原持有者的标记)</label>
+          <select class="f-tracker">
+            <option value="" ${!food.tracker ? 'selected' : ''}>无</option>
+            <option value="vegetable" ${food.tracker === 'vegetable' ? 'selected' : ''}>蔬菜打卡</option>
+            <option value="vitamin" ${food.tracker === 'vitamin' ? 'selected' : ''}>维生素打卡</option>
+          </select>
+        </div>
         <button class="food-edit-save-btn">保存修改（会同步更新这个食物已有的历史记录）</button>
         <button class="food-edit-delete-btn">删除这个食物</button>
       </div>
@@ -1398,6 +1456,8 @@ async function loadFoodEditList() {
         protein: parseFloat(row.querySelector('.f-protein').value),
         carb: parseFloat(row.querySelector('.f-carb').value),
         fat: parseFloat(row.querySelector('.f-fat').value),
+        tracker: row.querySelector('.f-tracker').value || null,
+        client_datetime: getClientDatetimeParam(),
       };
       if (!payload.name) { alert('名字不能为空'); return; }
       const res = await fetch('/api/foods/update', {
@@ -1429,7 +1489,7 @@ async function loadFoodEditList() {
       const res = await fetch('/api/foods/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: food.id })
+        body: JSON.stringify({ id: food.id, client_datetime: getClientDatetimeParam() })
       });
       const result = await res.json();
       if (result.ok) {
@@ -1450,6 +1510,8 @@ document.getElementById('add-food-save-btn').addEventListener('click', async () 
     protein: parseFloat(document.getElementById('new-food-protein').value) || 0,
     carb: parseFloat(document.getElementById('new-food-carb').value) || 0,
     fat: parseFloat(document.getElementById('new-food-fat').value) || 0,
+    tracker: document.getElementById('new-food-tracker').value || null,
+    client_datetime: getClientDatetimeParam(),
   };
   if (!payload.name) { alert('名字不能为空'); return; }
   if (!payload.unit) { alert('单位不能为空'); return; }
@@ -1464,6 +1526,7 @@ document.getElementById('add-food-save-btn').addEventListener('click', async () 
     ['name', 'unit', 'kcal', 'protein', 'carb', 'fat'].forEach(f => {
       document.getElementById(`new-food-${f}`).value = '';
     });
+    document.getElementById('new-food-tracker').value = '';
     loadFoodEditList();
     loadInitial();
   } else {
@@ -1737,7 +1800,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 7
             days = max(1, min(days, 365))  # 防止传入0、负数或离谱的大数字
-            payload = get_data_payload(days)
+            client_date, _ = _parse_client_datetime(qs.get("client_datetime", [None])[0])
+            payload = get_data_payload(days, client_date)
             payload["current_user"] = user
             payload["is_admin"] = self._current_is_admin()
             self._send_json(payload)
@@ -1810,10 +1874,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 7
             days = max(1, min(days, 365))
+            client_date, _ = _parse_client_datetime(qs.get("client_datetime", [None])[0])
 
-            nt.clear_today_entries()
+            nt.clear_today_entries(today_override=client_date)
             nt.write_summary_csv()
-            self._send_json(get_data_payload(days))
+            self._send_json(get_data_payload(days, client_date))
             return
 
         if parsed.path == "/api/undo":
@@ -1823,10 +1888,11 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 7
             days = max(1, min(days, 365))
+            client_date, _ = _parse_client_datetime(qs.get("client_datetime", [None])[0])
 
-            removed = nt.undo_last_entry()
+            removed = nt.undo_last_entry(today_override=client_date)
             nt.write_summary_csv()
-            payload = get_data_payload(days)
+            payload = get_data_payload(days, client_date)
             payload["undone"] = removed["food"] if removed else None
             self._send_json(payload)
             return
@@ -1883,6 +1949,7 @@ class Handler(BaseHTTPRequestHandler):
                     protein=float(data.get("protein", 0)),
                     carb=float(data.get("carb", 0)),
                     fat=float(data.get("fat", 0)),
+                    tracker=data.get("tracker") or None,
                 )
             except (TypeError, ValueError):
                 self._send_json({"error": "营养数值格式不对"}, status=400)
@@ -1890,7 +1957,8 @@ class Handler(BaseHTTPRequestHandler):
             if not data.get("name", "").strip():
                 self._send_json({"error": "食物名字不能为空"}, status=400)
                 return
-            self._send_json({"ok": True, "id": new_id, "foods": get_foods_list()})
+            client_date, _ = _parse_client_datetime(data.get("client_datetime"))
+            self._send_json({"ok": True, "id": new_id, "foods": get_foods_list(client_date)})
             return
 
         if parsed.path == "/api/foods/update":
@@ -1914,12 +1982,14 @@ class Handler(BaseHTTPRequestHandler):
                     protein=float(data.get("protein", 0)),
                     carb=float(data.get("carb", 0)),
                     fat=float(data.get("fat", 0)),
+                    tracker=data.get("tracker") or None,
                 )
             except (TypeError, ValueError):
                 self._send_json({"error": "营养数值格式不对"}, status=400)
                 return
             nt.write_summary_csv()  # 历史记录的营养值可能变了，导出用的汇总文件要跟着同步
-            self._send_json({"ok": ok, "updated_entries": updated_count, "foods": get_foods_list()})
+            client_date, _ = _parse_client_datetime(data.get("client_datetime"))
+            self._send_json({"ok": ok, "updated_entries": updated_count, "foods": get_foods_list(client_date)})
             return
 
         if parsed.path == "/api/foods/delete":
@@ -1932,7 +2002,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             food_id = data.get("id", "")
             ok = nt.delete_food(food_id)
-            self._send_json({"ok": ok, "foods": get_foods_list()})
+            client_date, _ = _parse_client_datetime(data.get("client_datetime"))
+            self._send_json({"ok": ok, "foods": get_foods_list(client_date)})
             return
 
         if parsed.path == "/api/settings/update":
@@ -2013,6 +2084,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             days = 7
         days = max(1, min(days, 365))
+        client_date, client_dt = _parse_client_datetime(qs.get("client_datetime", [None])[0])
 
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -2033,12 +2105,12 @@ class Handler(BaseHTTPRequestHandler):
             if servings <= 0:
                 continue
             item = nt.FOODS[food_id]
-            nt.append_entry(food_id, item, servings)
+            nt.append_entry(food_id, item, servings, client_datetime=client_dt)
             recorded.append(f"{item['name']} x{servings}份")
 
         nt.write_summary_csv()
 
-        payload = get_data_payload(days)
+        payload = get_data_payload(days, client_date)
         payload["recorded"] = recorded
         self._send_json(payload)
 
