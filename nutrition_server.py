@@ -190,20 +190,20 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>饮食记录</title>
 <style>
   :root {
-    --bg: #1a1d24;
-    --panel: #22262f;
-    --ink: #dcdde0;
-    --ink-soft: #838995;
-    --sage: #4a7c6f;
-    --sage-dim: #5f9186;
-    --border: #333944;
-    --flash: #2a2f3a;
-    --track: #2a2f3a;
-    --danger: #c1595f;
-    --danger-flash: #3a2428;
-    --modal-bg: #262019;
-    --modal-border: #4a3d29;
-    --modal-accent: #c9a15c;
+    --bg: #f5f3ec;
+    --panel: #fffefb;
+    --ink: #3c3b34;
+    --ink-soft: #8b8776;
+    --sage: #6b9c7f;
+    --sage-dim: #82b09a;
+    --border: #e4e0d3;
+    --flash: #edf3ee;
+    --track: #eeece3;
+    --danger: #c25f4a;
+    --danger-flash: #f7e9e5;
+    --modal-bg: #fbf3e6;
+    --modal-border: #e8d3a8;
+    --modal-accent: #b8863d;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -538,7 +538,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .food-input:focus {
     outline: none;
     border-color: var(--sage-dim);
-    box-shadow: 0 0 0 2px rgba(74,124,111,0.25);
+    box-shadow: 0 0 0 2px rgba(107,156,127,0.2);
   }
   .add-btn, .plus-btn {
     background: var(--sage);
@@ -562,6 +562,21 @@ HTML_PAGE = """<!DOCTYPE html>
     height: 32px;
     white-space: nowrap;
   }
+  .reorder-btn {
+    background: var(--sage);
+    color: #fffefb;
+    border: none;
+    font-family: inherit;
+    font-size: 13px;
+    width: 30px;
+    height: 30px;
+    border-radius: 5px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .reorder-btn:hover:not(:disabled) { background: var(--sage-dim); }
+  .reorder-btn:disabled { background: var(--track); color: var(--ink-soft); cursor: default; }
+  .active-toggle { background: var(--sage); color: #fffefb; border-color: var(--sage); }
 
   /* ---- 弹窗（编辑历史 / 管理食物 共用），刻意用跟主界面不同的暖色调，
      让人一眼分辨"我现在不是在做日常记录，是在改历史/改食物库" ---- */
@@ -569,7 +584,7 @@ HTML_PAGE = """<!DOCTYPE html>
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.55);
+    background: rgba(60, 55, 40, 0.35);
     align-items: flex-start;
     justify-content: center;
     padding: 24px 12px;
@@ -609,7 +624,7 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor: pointer;
     line-height: 1;
   }
-  .modal-close-btn:hover { background: rgba(201,161,92,0.15); }
+  .modal-close-btn:hover { background: rgba(184,134,61,0.12); }
 
   .day-editor-controls {
     display: flex;
@@ -825,6 +840,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <button class="clear-btn" id="clear-btn">清空今天</button>
       <button class="btn-small" id="open-history-btn">历史</button>
       <button class="btn-small" id="open-foods-btn">设置</button>
+      <button class="btn-small" id="reorder-toggle-btn">排序</button>
       __LOGOUT_BUTTON__
       <button class="btn-small" id="undo-btn">撤回上一步</button>
     </div>
@@ -1052,27 +1068,45 @@ function progressText(food) {
   return food.eaten_today > 0 ? fmtNum(food.eaten_today) : '';
 }
 
+let reorderMode = false;
+
 function renderFoodList() {
   const container = document.getElementById('food-list');
   container.innerHTML = '';
 
-  FOODS.forEach(food => {
+  FOODS.forEach((food, idx) => {
     const row = document.createElement('div');
     row.className = 'food-row';
     row.id = `row-${food.id}`;
+
+    const normalControls = `
+      <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
+      <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
+      <button class="add-btn" data-id="${food.id}">✓</button>
+      <button class="plus-btn" data-id="${food.id}">+1</button>
+    `;
+    const reorderControls = `
+      <button class="reorder-btn" data-id="${food.id}" data-dir="up" ${idx === 0 ? 'disabled' : ''}>▲</button>
+      <button class="reorder-btn" data-id="${food.id}" data-dir="down" ${idx === FOODS.length - 1 ? 'disabled' : ''}>▼</button>
+    `;
+
     row.innerHTML = `
       <div class="food-info">
         <div class="food-name">${food.name}</div>
-        <div class="food-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白</div>
+        <div class="food-meta">${food.unit} · ${food.kcal}kcal / ${food.protein}g蛋白 / ${food.carb}g碳水 / ${food.fat}g脂肪</div>
       </div>
       <div class="food-controls">
-        <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
-        <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
-        <button class="add-btn" data-id="${food.id}">✓</button>
-        <button class="plus-btn" data-id="${food.id}">+1</button>
+        ${reorderMode ? reorderControls : normalControls}
       </div>
     `;
     container.appendChild(row);
+
+    if (reorderMode) {
+      row.querySelectorAll('.reorder-btn').forEach(btn => {
+        btn.addEventListener('click', () => moveFood(food.id, btn.dataset.dir));
+      });
+      return;  // 排序模式下不需要绑定正常记录用的那些事件
+    }
 
     const input = row.querySelector('.food-input');
     const addBtn = row.querySelector('.add-btn');
@@ -1090,8 +1124,8 @@ function renderFoodList() {
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
         const allInputs = Array.from(document.querySelectorAll('.food-input'));
-        const idx = allInputs.indexOf(input);
-        const nextIdx = e.key === 'ArrowUp' ? idx - 1 : idx + 1;
+        const idx2 = allInputs.indexOf(input);
+        const nextIdx = e.key === 'ArrowUp' ? idx2 - 1 : idx2 + 1;
         if (nextIdx >= 0 && nextIdx < allInputs.length) {
           allInputs[nextIdx].focus();
           allInputs[nextIdx].select();
@@ -1100,6 +1134,25 @@ function renderFoodList() {
     });
   });
 }
+
+async function moveFood(foodId, direction) {
+  const res = await fetch('/api/foods/move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: foodId, direction, client_datetime: getClientDatetimeParam() })
+  });
+  const result = await res.json();
+  if (result.ok) {
+    FOODS = result.foods;
+    renderFoodList();
+  }
+}
+
+document.getElementById('reorder-toggle-btn').addEventListener('click', () => {
+  reorderMode = !reorderMode;
+  document.getElementById('reorder-toggle-btn').classList.toggle('active-toggle', reorderMode);
+  renderFoodList();
+});
 
 function refreshProgress(updatedFoods) {
   updatedFoods.forEach(food => {
@@ -1665,8 +1718,8 @@ LOGIN_PAGE = """<!DOCTYPE html>
 <title>登录</title>
 <style>
   :root {
-    --bg: #1a1d24; --panel: #22262f; --ink: #dcdde0; --ink-soft: #838995;
-    --sage: #4a7c6f; --sage-dim: #5f9186; --border: #333944; --danger: #c1595f;
+    --bg: #f5f3ec; --panel: #fffefb; --ink: #3c3b34; --ink-soft: #8b8776;
+    --sage: #6b9c7f; --sage-dim: #82b09a; --border: #e4e0d3; --danger: #c25f4a;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
@@ -2002,6 +2055,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             food_id = data.get("id", "")
             ok = nt.delete_food(food_id)
+            client_date, _ = _parse_client_datetime(data.get("client_datetime"))
+            self._send_json({"ok": ok, "foods": get_foods_list(client_date)})
+            return
+
+        if parsed.path == "/api/foods/move":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"error": "请求格式错误"}, status=400)
+                return
+            food_id = data.get("id", "")
+            direction = data.get("direction", "")
+            ok = nt.move_food(food_id, direction)
             client_date, _ = _parse_client_datetime(data.get("client_datetime"))
             self._send_json({"ok": ok, "foods": get_foods_list(client_date)})
             return

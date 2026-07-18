@@ -54,6 +54,9 @@ _DEFAULT_FOODS = {
     "8": {"name": "牛油果",     "unit": "1个",  "kcal": 240, "protein": 3,    "carb": 13,   "fat": 22},
     "9": {"name": "额外热量",   "unit": "1卡",  "kcal": 1,   "protein": 0,    "carb": 0,    "fat": 0},
     "10": {"name": "维生素补剂", "unit": "1份",  "kcal": 0,   "protein": 0,    "carb": 0,    "fat": 0, "tracker": "vitamin"},
+    # 地瓜数据来源：USDA生地瓜每100g=86kcal/1.57g蛋白/20.12g碳水/0.05g脂肪(多个独立
+    # 来源交叉验证一致)，按你说的220g生重换算。
+    "11": {"name": "地瓜",       "unit": "220g", "kcal": 189, "protein": 3.5,  "carb": 44.3, "fat": 0.1},
 }
 
 
@@ -161,6 +164,29 @@ def delete_food(food_id):
     if food_id not in FOODS:
         return False
     del FOODS[food_id]
+    _save_foods()
+    return True
+
+
+def move_food(food_id, direction):
+    """
+    把某个食物在列表里往上或往下挪一位，direction是"up"或"down"。
+    Python字典从3.7起会记住插入顺序，foods.json读写也是按这个顺序存的，
+    所以"调整显示顺序"本质上就是"重新按新顺序往字典里插入一遍"——
+    不需要额外的排序字段，字典本身的键顺序就是显示顺序。
+    """
+    global FOODS
+    ids = list(FOODS.keys())
+    if food_id not in ids:
+        return False
+    idx = ids.index(food_id)
+    if direction == "up" and idx > 0:
+        ids[idx - 1], ids[idx] = ids[idx], ids[idx - 1]
+    elif direction == "down" and idx < len(ids) - 1:
+        ids[idx + 1], ids[idx] = ids[idx], ids[idx + 1]
+    else:
+        return False  # 已经在最上面/最下面了，挪不动
+    FOODS = {fid: FOODS[fid] for fid in ids}
     _save_foods()
     return True
 
