@@ -163,6 +163,7 @@ def get_foods_list(client_today=None):
             "carb": item["carb"],
             "fat": item["fat"],
             "tracker": item.get("tracker"),
+            "daily_target": item.get("daily_target", 0),
             "eaten_today": eaten_today.get(food_id, 0.0),
         }
         for food_id, item in nt.FOODS.items()
@@ -516,6 +517,11 @@ HTML_PAGE = """<!DOCTYPE html>
     font-weight: 600;
     color: var(--sage);
     margin-right: 2px;
+  }
+  .progress-met {
+    text-decoration: line-through;
+    color: var(--ink-soft);
+    font-weight: 400;
   }
   .food-input {
     width: 44px;
@@ -915,6 +921,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <div><label>蛋白质(g)</label><input type="number" step="any" id="new-food-protein"></div>
           <div><label>碳水(g)</label><input type="number" step="any" id="new-food-carb"></div>
           <div><label>脂肪(g)</label><input type="number" step="any" id="new-food-fat"></div>
+          <div><label>每日目标份数(选填，支持小数)</label><input type="number" step="any" id="new-food-target"></div>
           <div class="full-width">
             <label>特殊标记(选填)</label>
             <select id="new-food-tracker">
@@ -1064,7 +1071,12 @@ function fmtNum(n) {
   return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
 
-function progressText(food) {
+function progressHTML(food) {
+  const target = food.daily_target || 0;
+  if (target > 0) {
+    const met = food.eaten_today >= target;
+    return `<span class="${met ? 'progress-met' : ''}">${fmtNum(food.eaten_today)}/${fmtNum(target)}</span>`;
+  }
   return food.eaten_today > 0 ? fmtNum(food.eaten_today) : '';
 }
 
@@ -1080,7 +1092,7 @@ function renderFoodList() {
     row.id = `row-${food.id}`;
 
     const normalControls = `
-      <div class="food-progress" id="progress-${food.id}">${progressText(food)}</div>
+      <div class="food-progress" id="progress-${food.id}">${progressHTML(food)}</div>
       <input type="number" step="any" inputmode="decimal" class="food-input" data-id="${food.id}" value="" placeholder="0">
       <button class="add-btn" data-id="${food.id}">✓</button>
       <button class="plus-btn" data-id="${food.id}">+1</button>
@@ -1158,7 +1170,7 @@ function refreshProgress(updatedFoods) {
   updatedFoods.forEach(food => {
     const el = document.getElementById(`progress-${food.id}`);
     if (!el) return;
-    el.textContent = progressText(food);
+    el.innerHTML = progressHTML(food);
   });
   FOODS = updatedFoods;
 }
@@ -1477,6 +1489,7 @@ async function loadFoodEditList() {
         <div><label>蛋白质(g)</label><input type="number" step="any" class="f-protein" value="${food.protein}"></div>
         <div><label>碳水(g)</label><input type="number" step="any" class="f-carb" value="${food.carb}"></div>
         <div><label>脂肪(g)</label><input type="number" step="any" class="f-fat" value="${food.fat}"></div>
+        <div><label>每日目标份数(选填，支持小数)</label><input type="number" step="any" class="f-target" value="${food.daily_target || ''}"></div>
         <div class="full-width">
           <label>特殊标记(选填，同类型只能有一个食物持有，设置后会自动取消原持有者的标记)</label>
           <select class="f-tracker">
@@ -1510,6 +1523,7 @@ async function loadFoodEditList() {
         carb: parseFloat(row.querySelector('.f-carb').value),
         fat: parseFloat(row.querySelector('.f-fat').value),
         tracker: row.querySelector('.f-tracker').value || null,
+        daily_target: parseFloat(row.querySelector('.f-target').value) || 0,
         client_datetime: getClientDatetimeParam(),
       };
       if (!payload.name) { alert('名字不能为空'); return; }
@@ -1564,6 +1578,7 @@ document.getElementById('add-food-save-btn').addEventListener('click', async () 
     carb: parseFloat(document.getElementById('new-food-carb').value) || 0,
     fat: parseFloat(document.getElementById('new-food-fat').value) || 0,
     tracker: document.getElementById('new-food-tracker').value || null,
+    daily_target: parseFloat(document.getElementById('new-food-target').value) || 0,
     client_datetime: getClientDatetimeParam(),
   };
   if (!payload.name) { alert('名字不能为空'); return; }
@@ -1576,7 +1591,7 @@ document.getElementById('add-food-save-btn').addEventListener('click', async () 
   });
   const result = await res.json();
   if (result.ok) {
-    ['name', 'unit', 'kcal', 'protein', 'carb', 'fat'].forEach(f => {
+    ['name', 'unit', 'kcal', 'protein', 'carb', 'fat', 'target'].forEach(f => {
       document.getElementById(`new-food-${f}`).value = '';
     });
     document.getElementById('new-food-tracker').value = '';
@@ -2003,6 +2018,7 @@ class Handler(BaseHTTPRequestHandler):
                     carb=float(data.get("carb", 0)),
                     fat=float(data.get("fat", 0)),
                     tracker=data.get("tracker") or None,
+                    daily_target=float(data.get("daily_target", 0) or 0),
                 )
             except (TypeError, ValueError):
                 self._send_json({"error": "营养数值格式不对"}, status=400)
@@ -2036,6 +2052,7 @@ class Handler(BaseHTTPRequestHandler):
                     carb=float(data.get("carb", 0)),
                     fat=float(data.get("fat", 0)),
                     tracker=data.get("tracker") or None,
+                    daily_target=float(data.get("daily_target", 0) or 0),
                 )
             except (TypeError, ValueError):
                 self._send_json({"error": "营养数值格式不对"}, status=400)

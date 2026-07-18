@@ -115,12 +115,15 @@ def _clear_other_holders_of_tracker(tracker_type, except_id=None):
             item.pop("tracker", None)
 
 
-def add_food(name, unit, kcal, protein, carb, fat, tracker=None):
+def add_food(name, unit, kcal, protein, carb, fat, tracker=None, daily_target=0):
     """新增一种食物，用只增不减的计数器分配id，绝不会跟历史上曾经存在过、哪怕已被删除的食物撞号。"""
     global _NEXT_FOOD_ID
     new_id = str(_NEXT_FOOD_ID)
     _clear_other_holders_of_tracker(tracker, except_id=new_id)
-    entry = {"name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat}
+    entry = {
+        "name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
+        "daily_target": daily_target,
+    }
     if tracker:
         entry["tracker"] = tracker
     FOODS[new_id] = entry
@@ -129,9 +132,9 @@ def add_food(name, unit, kcal, protein, carb, fat, tracker=None):
     return new_id
 
 
-def update_food(food_id, name, unit, kcal, protein, carb, fat, tracker=None):
+def update_food(food_id, name, unit, kcal, protein, carb, fat, tracker=None, daily_target=0):
     """
-    修改某个食物的定义（名字/单位/营养值/特殊标记），并把这个改动同步应用到
+    修改某个食物的定义（名字/单位/营养值/特殊标记/每日目标份数），并把这个改动同步应用到
     这个食物已有的所有历史记录上——按你的要求，"编辑"代表的是同一个食物
     的定义在演进，不是变成了另一个东西，所以历史记录应该跟着新定义重算，
     而不是继续保留编辑前的旧快照。
@@ -145,7 +148,10 @@ def update_food(food_id, name, unit, kcal, protein, carb, fat, tracker=None):
     if food_id not in FOODS:
         return False, 0
     _clear_other_holders_of_tracker(tracker, except_id=food_id)
-    entry = {"name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat}
+    entry = {
+        "name": name, "unit": unit, "kcal": kcal, "protein": protein, "carb": carb, "fat": fat,
+        "daily_target": daily_target,
+    }
     if tracker:
         entry["tracker"] = tracker
     FOODS[food_id] = entry
